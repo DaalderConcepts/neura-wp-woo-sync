@@ -1,0 +1,341 @@
+/**
+ * WooCommerce Meta Ads Connector - Admin Styles
+ */
+
+.wcmac-settings {
+    max-width: 1400px;
+    margin: 20px 0;
+}
+
+.wcmac-settings h1 {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.wcmac-settings > .description {
+    font-size: 14px;
+    margin-bottom: 24px;
+    color: #646970;
+}
+
+/* Grid Layout */
+.wcmac-grid {
+    display: grid;
+    grid-template-columns: 1fr 350px;
+    gap: 20px;
+    margin-top: 20px;
+}
+
+@media (max-width: 1200px) {
+    .wcmac-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Cards */
+.wcmac-card {
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-radius: 4px;
+    padding: 20px;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+}
+
+.wcmac-card h2,
+.wcmac-card h3 {
+    margin-top: 0;
+    margin-bottom: 16px;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.wcmac-main-settings {
+    grid-column: 1;
+}
+
+.wcmac-sidebar {
+    grid-column: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+@media (max-width: 1200px) {
+    .wcmac-main-settings,
+    .wcmac-sidebar {
+        grid-column: 1;
+    }
+}
+
+.wcmac-api-info {
+    grid-column: 1 / -1;
+    margin-top: 20px;
+}
+
+/* Status Indicators */
+.nwws-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px;
+    border-radius: 4px;
+    margin-bottom: 12px;
+    font-size: 14px;
+}
+
+.nwws-status .dashicons {
+    width: 20px;
+    height: 20px;
+    font-size: 20px;
+}
+
+.nwws-status-success {
+    background: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+}
+
+.nwws-status-success .dashicons {
+    color: #28a745;
+}
+
+.nwws-status-error {
+    background: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+}
+
+.nwws-status-error .dashicons {
+    color: #dc3545;
+}
+
+.nwws-status-warning {
+    background: #fff3cd;
+    color: #856404;
+    border: 1px solid #ffeaa7;
+}
+
+.nwws-status-warning .dashicons {
+    color: #ffc107;
+}
+
+.nwws-status-unknown {
+    background: #d1ecf1;
+    color: #0c5460;
+    border: 1px solid #bee5eb;
+}
+
+.nwws-status-unknown .dashicons {
+    color: #17a2b8;
+}
+
+/* Statistics */
+#wcmac-sync-stats {
+    margin-bottom: 16px;
+}
+
+.wcmac-stat {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid #f0f0f1;
+}
+
+.wcmac-stat:last-child {
+    border-bottom: none;
+}
+
+.wcmac-stat-label {
+    font-size: 14px;
+    color: #646970;
+}
+
+.wcmac-stat-value {
+    font-size: 18px;
+    font-weight: 600;
+    color: #1d2327;
+}
+
+/* Buttons */
+.wcmac-card button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.wcmac-card button .dashicons {
+    width: 18px;
+    height: 18px;
+    font-size: 18px;
+}
+
+.wcmac-sync-btn {
+    margin-top: 8px !important;
+}
+
+.wcmac-sync-btn:first-of-type {
+    margin-top: 12px !important;
+}
+
+button.loading {
+    position: relative;
+    color: transparent !important;
+    pointer-events: none;
+}
+
+button.loading::after {
+    content: "";
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    top: 50%;
+    left: 50%;
+    margin-left: -8px;
+    margin-top: -8px;
+    border: 2px solid #f3f3f3;
+    border-top: 2px solid #2271b1;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* Documentation List */
+.wcmac-docs-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.wcmac-docs-list li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid #f0f0f1;
+}
+
+.wcmac-docs-list li:last-child {
+    border-bottom: none;
+}
+
+.wcmac-docs-list .dashicons {
+    width: 18px;
+    height: 18px;
+    font-size: 18px;
+    color: #2271b1;
+}
+
+.wcmac-docs-list a {
+    text-decoration: none;
+    color: #2271b1;
+}
+
+.wcmac-docs-list a:hover {
+    text-decoration: underline;
+}
+
+/* API Endpoints Table */
+.wcmac-api-info table {
+    margin-top: 12px;
+}
+
+.wcmac-api-info code {
+    background: #f0f0f1;
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-size: 13px;
+    color: #d63638;
+}
+
+.wcmac-method {
+    display: inline-block;
+    background: #2271b1;
+    color: #fff;
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+/* Form Improvements */
+.wcmac-main-settings .form-table th {
+    width: 200px;
+    padding: 20px 10px 20px 0;
+}
+
+.wcmac-main-settings .form-table td {
+    padding: 20px 10px;
+}
+
+.wcmac-main-settings fieldset label {
+    display: block;
+    margin: 8px 0;
+}
+
+.wcmac-main-settings hr {
+    margin: 24px 0;
+    border: none;
+    border-top: 1px solid #dcdcde;
+}
+
+/* Responsive */
+@media (max-width: 782px) {
+    .wcmac-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .wcmac-main-settings .form-table th,
+    .wcmac-main-settings .form-table td {
+        display: block;
+        width: 100%;
+        padding: 10px 0;
+    }
+    
+    .wcmac-main-settings .form-table th {
+        padding-bottom: 5px;
+    }
+}
+
+/* Loading Overlay */
+.nwws-loading-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 999999;
+}
+
+.nwws-loading-spinner {
+    background: #fff;
+    padding: 30px;
+    border-radius: 8px;
+    text-align: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.nwws-loading-spinner .spinner {
+    float: none;
+    margin: 0 auto 16px;
+}
+
+.nwws-loading-spinner p {
+    margin: 0;
+    font-size: 14px;
+    color: #646970;
+}
