@@ -13,6 +13,7 @@
 
         bindEvents: function () {
             $('#nwws-test-connection').on('click', this.testConnection);
+            $('#nwws-test-push').on('click', this.testPush);
             $('#nwws-refresh-stats').on('click', this.loadStats);
             $('#nwws-sync-products').on('click', this.syncProducts);
             $('#nwws-sync-orders').on('click', this.syncOrders);
@@ -29,6 +30,35 @@
                 url: nwwsData.ajaxUrl,
                 type: 'POST',
                 data: { action: 'nwws_test_connection', nonce: nwwsData.nonce },
+                success: function (response) {
+                    const cls = response.success ? 'nwws-status-success' : 'nwws-status-error';
+                    const ico = response.success ? 'yes-alt' : 'dismiss';
+                    $status.html(
+                        `<p class="nwws-status ${cls}"><span class="dashicons dashicons-${ico}"></span>${response.data}</p>`
+                    );
+                },
+                error: function () {
+                    $status.html(
+                        '<p class="nwws-status nwws-status-error"><span class="dashicons dashicons-dismiss"></span>Er is een fout opgetreden.</p>'
+                    );
+                },
+                complete: function () {
+                    $btn.removeClass('loading').prop('disabled', false);
+                },
+            });
+        },
+
+        testPush: function (e) {
+            e.preventDefault();
+            const $btn = $(this);
+            const $status = $('#nwws-push-status');
+
+            $btn.addClass('loading').prop('disabled', true);
+
+            $.ajax({
+                url: nwwsData.ajaxUrl,
+                type: 'POST',
+                data: { action: 'nwws_test_push', nonce: nwwsData.nonce },
                 success: function (response) {
                     const cls = response.success ? 'nwws-status-success' : 'nwws-status-error';
                     const ico = response.success ? 'yes-alt' : 'dismiss';

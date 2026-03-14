@@ -4,14 +4,25 @@
  */
 defined('ABSPATH') || exit;
 
-$sync_enabled      = get_option('nwws_sync_enabled', '0') === '1';
-$sync_products     = get_option('nwws_sync_products', '1') === '1';
-$sync_orders       = get_option('nwws_sync_orders', '1') === '1';
-$sync_customers    = get_option('nwws_sync_customers', '1') === '1';
-$track_conversions = get_option('nwws_track_conversions', '1') === '1';
-$api_url           = get_option('nwws_api_url', '');
-$api_key           = get_option('nwws_api_key', '');
-$no_conn           = empty($api_url) || empty($api_key);
+$sync_enabled           = get_option('nwws_sync_enabled', '0') === '1';
+$sync_products          = get_option('nwws_sync_products', '1') === '1';
+$sync_orders            = get_option('nwws_sync_orders', '1') === '1';
+$sync_customers         = get_option('nwws_sync_customers', '1') === '1';
+$track_conversions      = get_option('nwws_track_conversions', '1') === '1';
+$api_url                = get_option('nwws_api_url', '');
+$api_key                = get_option('nwws_api_key', '');
+$push_url               = get_option('nwws_push_url', '');
+$push_key               = get_option('nwws_push_key', '');
+$no_conn                = empty($api_url) || empty($api_key);
+$no_push                = empty($push_url) || empty($push_key);
+$sync_fields_prices     = get_option('nwws_sync_fields_prices',     '1') === '1';
+$sync_fields_cogs       = get_option('nwws_sync_fields_cogs',       '1') === '1';
+$sync_fields_stock      = get_option('nwws_sync_fields_stock',      '1') === '1';
+$sync_fields_ean        = get_option('nwws_sync_fields_ean',        '1') === '1';
+$sync_fields_brand      = get_option('nwws_sync_fields_brand',      '1') === '1';
+$sync_fields_color      = get_option('nwws_sync_fields_color',      '1') === '1';
+$sync_fields_size       = get_option('nwws_sync_fields_size',       '1') === '1';
+$sync_fields_categories = get_option('nwws_sync_fields_categories', '1') === '1';
 ?>
 
 <div class="wrap nwws-settings">
@@ -82,6 +93,60 @@ $no_conn           = empty($api_url) || empty($api_key);
                     </tr>
                 </table>
 
+                <hr>
+
+                <h3>Neuramerce Webhook Instellingen</h3>
+                <p class="description">
+                    Kopieer de <strong>Webhook URL</strong> en <strong>API Key</strong> uit Neuramerce
+                    (<em>Voorraad → WooCommerce → Plugin Push Sync</em>) en plak ze hieronder.
+                    Zodra geconfigureerd worden producten automatisch naar Neuramerce gepusht bij elke wijziging.
+                </p>
+
+                <table class="form-table">
+                    <tr>
+                        <th scope="row"><label for="nwws_push_url">Webhook URL</label></th>
+                        <td>
+                            <input type="url" id="nwws_push_url" name="nwws_push_url"
+                                   value="<?php echo esc_attr($push_url); ?>"
+                                   class="large-text" placeholder="https://app.neuramerce.com/api/v1/inventory/woocommerce/webhook?workspace=...">
+                            <p class="description">De volledige webhook URL inclusief <code>?workspace=...</code> parameter</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="nwws_push_key">API Key</label></th>
+                        <td>
+                            <input type="password" id="nwws_push_key" name="nwws_push_key"
+                                   value="<?php echo esc_attr($push_key); ?>"
+                                   class="regular-text" placeholder="32-karakter hex sleutel">
+                            <p class="description">De API sleutel uit Neuramerce (32 karakters)</p>
+                        </td>
+                    </tr>
+                </table>
+
+                <hr>
+
+                <h3>Veld Synchronisatie</h3>
+                <p class="description">Bepaal welke productvelden naar Neuramerce worden gestuurd bij een update.</p>
+
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Te synchroniseren velden</th>
+                        <td>
+                            <fieldset>
+                                <label><input type="checkbox" name="nwws_sync_fields_prices"     value="1" <?php checked($sync_fields_prices); ?>>     <strong>Prijzen</strong> — reguliere prijs en actieprijs</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_cogs"       value="1" <?php checked($sync_fields_cogs); ?>>       <strong>COGS</strong> — inkoopprijs en valuta</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_stock"      value="1" <?php checked($sync_fields_stock); ?>>      <strong>Voorraad</strong> — stockstatus en -hoeveelheid</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_ean"        value="1" <?php checked($sync_fields_ean); ?>>        <strong>EAN / GTIN / Barcode</strong> — global_unique_id of meta veld</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_brand"      value="1" <?php checked($sync_fields_brand); ?>>      <strong>Merk</strong> — brand/merk attribuut</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_color"      value="1" <?php checked($sync_fields_color); ?>>      <strong>Kleur</strong> — color/kleur attribuut</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_size"       value="1" <?php checked($sync_fields_size); ?>>       <strong>Maat</strong> — size/maat attribuut</label><br>
+                                <label><input type="checkbox" name="nwws_sync_fields_categories" value="1" <?php checked($sync_fields_categories); ?>> <strong>Categorieën</strong> — product categorienamen</label>
+                            </fieldset>
+                            <p class="description">SKU, naam en permalink worden altijd gesynchroniseerd.</p>
+                        </td>
+                    </tr>
+                </table>
+
                 <?php submit_button('Instellingen Opslaan', 'primary', 'nwws_save_settings'); ?>
             </form>
         </div>
@@ -106,6 +171,27 @@ $no_conn           = empty($api_url) || empty($api_key);
                 </div>
                 <button type="button" class="button button-secondary" id="nwws-test-connection" <?php disabled($no_conn); ?>>
                     <span class="dashicons dashicons-admin-plugins"></span> Test Verbinding
+                </button>
+            </div>
+
+            <!-- Webhook Status -->
+            <div class="wcmac-card">
+                <h3>Webhook Status</h3>
+                <div id="nwws-push-status">
+                    <?php if ($no_push): ?>
+                        <p class="wcmac-status wcmac-status-warning">
+                            <span class="dashicons dashicons-warning"></span>
+                            Vul Webhook URL en API Key in
+                        </p>
+                    <?php else: ?>
+                        <p class="wcmac-status wcmac-status-unknown">
+                            <span class="dashicons dashicons-update"></span>
+                            Klik op "Test Webhook" om te controleren
+                        </p>
+                    <?php endif; ?>
+                </div>
+                <button type="button" class="button button-secondary" id="nwws-test-push" <?php disabled($no_push); ?>>
+                    <span class="dashicons dashicons-update"></span> Test Webhook
                 </button>
             </div>
 

@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.1.2
+ * Version:      1.2.0
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.1.2');
+define('NWWS_VERSION',    '1.2.0');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -190,6 +190,7 @@ class Neura_WooCommerce_Sync {
         add_action('wp_ajax_nwws_sync_all_products',  [$this, 'ajax_sync_all_products']);
         add_action('wp_ajax_nwws_sync_all_orders',    [$this, 'ajax_sync_all_orders']);
         add_action('wp_ajax_nwws_get_sync_stats',     [$this, 'ajax_get_sync_stats']);
+        add_action('wp_ajax_nwws_test_push',          [$this, 'ajax_test_push']);
     }
 
     public function init(): void {
@@ -222,6 +223,8 @@ class Neura_WooCommerce_Sync {
             'nonce'   => wp_create_nonce('nwws_nonce'),
             'apiUrl'  => get_option('nwws_api_url', ''),
             'apiKey'  => get_option('nwws_api_key', ''),
+            'pushUrl' => get_option('nwws_push_url', ''),
+            'pushKey' => get_option('nwws_push_key', ''),
         ]);
     }
 
@@ -229,13 +232,23 @@ class Neura_WooCommerce_Sync {
         if (isset($_POST['nwws_save_settings'])) {
             check_admin_referer('nwws_settings');
 
-            update_option('nwws_api_url',          sanitize_text_field($_POST['nwws_api_url']));
-            update_option('nwws_api_key',          sanitize_text_field($_POST['nwws_api_key']));
-            update_option('nwws_sync_enabled',     isset($_POST['nwws_sync_enabled'])     ? '1' : '0');
-            update_option('nwws_sync_products',    isset($_POST['nwws_sync_products'])    ? '1' : '0');
-            update_option('nwws_sync_orders',      isset($_POST['nwws_sync_orders'])      ? '1' : '0');
-            update_option('nwws_sync_customers',   isset($_POST['nwws_sync_customers'])   ? '1' : '0');
-            update_option('nwws_track_conversions',isset($_POST['nwws_track_conversions'])? '1' : '0');
+            update_option('nwws_api_url',                  sanitize_text_field($_POST['nwws_api_url']));
+            update_option('nwws_api_key',                  sanitize_text_field($_POST['nwws_api_key']));
+            update_option('nwws_push_url',                 esc_url_raw($_POST['nwws_push_url'] ?? ''));
+            update_option('nwws_push_key',                 sanitize_text_field($_POST['nwws_push_key'] ?? ''));
+            update_option('nwws_sync_enabled',             isset($_POST['nwws_sync_enabled'])             ? '1' : '0');
+            update_option('nwws_sync_products',            isset($_POST['nwws_sync_products'])            ? '1' : '0');
+            update_option('nwws_sync_orders',              isset($_POST['nwws_sync_orders'])              ? '1' : '0');
+            update_option('nwws_sync_customers',           isset($_POST['nwws_sync_customers'])           ? '1' : '0');
+            update_option('nwws_track_conversions',        isset($_POST['nwws_track_conversions'])        ? '1' : '0');
+            update_option('nwws_sync_fields_prices',       isset($_POST['nwws_sync_fields_prices'])       ? '1' : '0');
+            update_option('nwws_sync_fields_cogs',         isset($_POST['nwws_sync_fields_cogs'])         ? '1' : '0');
+            update_option('nwws_sync_fields_stock',        isset($_POST['nwws_sync_fields_stock'])        ? '1' : '0');
+            update_option('nwws_sync_fields_ean',          isset($_POST['nwws_sync_fields_ean'])          ? '1' : '0');
+            update_option('nwws_sync_fields_brand',        isset($_POST['nwws_sync_fields_brand'])        ? '1' : '0');
+            update_option('nwws_sync_fields_color',        isset($_POST['nwws_sync_fields_color'])        ? '1' : '0');
+            update_option('nwws_sync_fields_size',         isset($_POST['nwws_sync_fields_size'])         ? '1' : '0');
+            update_option('nwws_sync_fields_categories',   isset($_POST['nwws_sync_fields_categories'])   ? '1' : '0');
 
             echo '<div class="notice notice-success"><p>Instellingen opgeslagen!</p></div>';
         }
@@ -328,8 +341,16 @@ class Neura_WooCommerce_Sync {
         $product = wc_get_product($product_id);
         if (!$product) return;
 
-        $cogs_currency = get_post_meta($product_id, '_cogs_currency', true) ?: 'EUR';
+        $push_url = get_option('nwws_push_url', '');
+        $push_key = get_option('nwws_push_key', '');
 
+        if (!empty($push_url) && !empty($push_key)) {
+            $this->push_product_to_neuramerce($product, $product_id, $push_url, $push_key);
+            return;
+        }
+
+        // Legacy fallback (no dedicated push endpoint configured)
+        $cogs_currency = get_post_meta($product_id, '_cogs_currency', true) ?: 'EUR';
         $data = [
             'id'             => $product->get_id(),
             'name'           => $product->get_name(),
@@ -347,27 +368,111 @@ class Neura_WooCommerce_Sync {
             'type'           => $product->get_type(),
             'updated_at'     => current_time('mysql'),
         ];
-
-        if ($product->is_type('variable')) {
-            $variations = [];
-            foreach ($product->get_children() as $variation_id) {
-                $variation = wc_get_product($variation_id);
-                if ($variation) {
-                    $variations[] = [
-                        'id'            => $variation->get_id(),
-                        'sku'           => $variation->get_sku(),
-                        'price'         => $variation->get_price(),
-                        'cogs'          => get_post_meta($variation_id, '_cogs', true),
-                        'cogs_currency' => get_post_meta($variation_id, '_cogs_currency', true) ?: 'EUR',
-                        'attributes'    => $variation->get_attributes(),
-                    ];
-                }
-            }
-            $data['variations'] = $variations;
-        }
-
         $this->send_to_api('products', $data, 'POST');
         update_post_meta($product_id, '_nwws_last_sync', current_time('timestamp'));
+    }
+
+    private function push_product_to_neuramerce(\WC_Product $product, int $product_id, string $push_url, string $push_key): void {
+        $sku = $product->get_sku();
+        if (empty($sku)) return; // Neuramerce requires SKU
+
+        // Always send identity fields
+        $data = [
+            'id'        => $product->get_id(),
+            'sku'       => $sku,
+            'name'      => $product->get_name(),
+            'permalink' => $product->get_permalink(),
+        ];
+
+        // Prices
+        if (get_option('nwws_sync_fields_prices', '1') === '1') {
+            $data['regular_price'] = $product->get_regular_price();
+            $data['sale_price']    = $product->get_sale_price();
+        }
+
+        // COGS
+        if (get_option('nwws_sync_fields_cogs', '1') === '1') {
+            $data['cogs']          = get_post_meta($product_id, '_cogs', true);
+            $data['cogs_currency'] = get_post_meta($product_id, '_cogs_currency', true) ?: 'EUR';
+        }
+
+        // Stock
+        if (get_option('nwws_sync_fields_stock', '1') === '1') {
+            $data['stock_status']   = $product->get_stock_status();
+            $data['stock_quantity'] = $product->get_stock_quantity();
+        }
+
+        // EAN / GTIN / UPC / ISBN
+        if (get_option('nwws_sync_fields_ean', '1') === '1') {
+            $ean = '';
+            // WooCommerce 8.6+ stores GTIN as global_unique_id
+            if (method_exists($product, 'get_global_unique_id')) {
+                $ean = (string) $product->get_global_unique_id();
+            }
+            // Fallback: common meta_data keys
+            if (empty($ean)) {
+                foreach (['_ean', '_gtin', 'barcode', '_barcode', 'ean', 'gtin', '_wc_gtin'] as $meta_key) {
+                    $val = get_post_meta($product_id, $meta_key, true);
+                    if (!empty($val)) { $ean = (string) $val; break; }
+                }
+            }
+            $data['ean'] = $ean ?: null;
+        }
+
+        // Brand / Color / Size from WooCommerce attributes
+        $sync_brand = get_option('nwws_sync_fields_brand', '1') === '1';
+        $sync_color = get_option('nwws_sync_fields_color', '1') === '1';
+        $sync_size  = get_option('nwws_sync_fields_size',  '1') === '1';
+
+        if ($sync_brand || $sync_color || $sync_size) {
+            $brand = $color = $size = null;
+            foreach ($product->get_attributes() as $slug => $attribute) {
+                if ($attribute->is_taxonomy()) {
+                    $label   = strtolower(wc_attribute_label($slug));
+                    $options = wc_get_product_terms($product_id, $slug, ['fields' => 'names']);
+                    $value   = implode(', ', $options);
+                } else {
+                    $label   = strtolower($attribute->get_name());
+                    $value   = implode(', ', $attribute->get_options());
+                }
+                if (preg_match('/brand|merk|fabrikant|manufacturer/', $label)) {
+                    $brand = $value ?: null;
+                } elseif (preg_match('/colou?r|kleur/', $label)) {
+                    $color = $value ?: null;
+                } elseif (preg_match('/size|maat|afmeting|formaat/', $label)) {
+                    $size = $value ?: null;
+                }
+            }
+            if ($sync_brand) $data['brand'] = $brand;
+            if ($sync_color) $data['color'] = $color;
+            if ($sync_size)  $data['size']  = $size;
+        }
+
+        // Categories
+        if (get_option('nwws_sync_fields_categories', '1') === '1') {
+            $data['categories'] = wp_get_post_terms($product_id, 'product_cat', ['fields' => 'names']);
+        }
+
+        $response = wp_remote_post($push_url, [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-API-Key'    => $push_key,
+            ],
+            'body'    => wp_json_encode($data),
+            'timeout' => 30,
+        ]);
+
+        if (is_wp_error($response)) {
+            error_log('NWWS Push Error: ' . $response->get_error_message());
+            return;
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code >= 200 && $code < 300) {
+            update_post_meta($product_id, '_nwws_last_sync', current_time('timestamp'));
+        } else {
+            error_log('NWWS Push Error: HTTP ' . $code . ' — ' . wp_remote_retrieve_body($response));
+        }
     }
 
     // =========================================================================
@@ -494,14 +599,24 @@ class Neura_WooCommerce_Sync {
 
     public function rest_get_settings(): \WP_REST_Response {
         return rest_ensure_response([
-            'api_url'          => get_option('nwws_api_url', ''),
-            'api_key'          => get_option('nwws_api_key', '') ? '***' : '',
-            'sync_enabled'     => get_option('nwws_sync_enabled', '0') === '1',
-            'sync_products'    => get_option('nwws_sync_products', '1') === '1',
-            'sync_orders'      => get_option('nwws_sync_orders', '1') === '1',
-            'sync_customers'   => get_option('nwws_sync_customers', '1') === '1',
-            'track_conversions'=> get_option('nwws_track_conversions', '1') === '1',
-            'version'          => NWWS_VERSION,
+            'api_url'               => get_option('nwws_api_url', ''),
+            'api_key'               => get_option('nwws_api_key', '') ? '***' : '',
+            'push_url'              => get_option('nwws_push_url', ''),
+            'push_key'              => get_option('nwws_push_key', '') ? '***' : '',
+            'sync_enabled'          => get_option('nwws_sync_enabled', '0') === '1',
+            'sync_products'         => get_option('nwws_sync_products', '1') === '1',
+            'sync_orders'           => get_option('nwws_sync_orders', '1') === '1',
+            'sync_customers'        => get_option('nwws_sync_customers', '1') === '1',
+            'track_conversions'     => get_option('nwws_track_conversions', '1') === '1',
+            'sync_fields_prices'    => get_option('nwws_sync_fields_prices', '1') === '1',
+            'sync_fields_cogs'      => get_option('nwws_sync_fields_cogs', '1') === '1',
+            'sync_fields_stock'     => get_option('nwws_sync_fields_stock', '1') === '1',
+            'sync_fields_ean'       => get_option('nwws_sync_fields_ean', '1') === '1',
+            'sync_fields_brand'     => get_option('nwws_sync_fields_brand', '1') === '1',
+            'sync_fields_color'     => get_option('nwws_sync_fields_color', '1') === '1',
+            'sync_fields_size'      => get_option('nwws_sync_fields_size', '1') === '1',
+            'sync_fields_categories'=> get_option('nwws_sync_fields_categories', '1') === '1',
+            'version'               => NWWS_VERSION,
         ]);
     }
 
@@ -509,13 +624,23 @@ class Neura_WooCommerce_Sync {
         $body = $request->get_json_params();
 
         $map = [
-            'api_url'           => 'nwws_api_url',
-            'api_key'           => 'nwws_api_key',
-            'sync_enabled'      => 'nwws_sync_enabled',
-            'sync_products'     => 'nwws_sync_products',
-            'sync_orders'       => 'nwws_sync_orders',
-            'sync_customers'    => 'nwws_sync_customers',
-            'track_conversions' => 'nwws_track_conversions',
+            'api_url'                => 'nwws_api_url',
+            'api_key'                => 'nwws_api_key',
+            'push_url'               => 'nwws_push_url',
+            'push_key'               => 'nwws_push_key',
+            'sync_enabled'           => 'nwws_sync_enabled',
+            'sync_products'          => 'nwws_sync_products',
+            'sync_orders'            => 'nwws_sync_orders',
+            'sync_customers'         => 'nwws_sync_customers',
+            'track_conversions'      => 'nwws_track_conversions',
+            'sync_fields_prices'     => 'nwws_sync_fields_prices',
+            'sync_fields_cogs'       => 'nwws_sync_fields_cogs',
+            'sync_fields_stock'      => 'nwws_sync_fields_stock',
+            'sync_fields_ean'        => 'nwws_sync_fields_ean',
+            'sync_fields_brand'      => 'nwws_sync_fields_brand',
+            'sync_fields_color'      => 'nwws_sync_fields_color',
+            'sync_fields_size'       => 'nwws_sync_fields_size',
+            'sync_fields_categories' => 'nwws_sync_fields_categories',
         ];
 
         foreach ($map as $key => $option) {
@@ -640,6 +765,33 @@ class Neura_WooCommerce_Sync {
         wp_send_json_success(count($orders) . ' orders gesynchroniseerd.');
     }
 
+    public function ajax_test_push(): void {
+        check_ajax_referer('nwws_nonce', 'nonce');
+
+        $push_url = get_option('nwws_push_url', '');
+        $push_key = get_option('nwws_push_key', '');
+
+        if (empty($push_url) || empty($push_key)) {
+            wp_send_json_error('Webhook URL en API Key zijn vereist.');
+        }
+
+        $response = wp_remote_get($push_url, [
+            'headers' => ['X-API-Key' => $push_key],
+            'timeout' => 15,
+        ]);
+
+        if (is_wp_error($response)) {
+            wp_send_json_error('Verbinding mislukt: ' . $response->get_error_message());
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code === 200) {
+            wp_send_json_success('Neuramerce webhook bereikbaar!');
+        } else {
+            wp_send_json_error('Verbinding mislukt (HTTP ' . $code . ')');
+        }
+    }
+
     public function ajax_get_sync_stats(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
         global $wpdb;
@@ -693,9 +845,19 @@ add_action('plugins_loaded', function () {
 
 // Activation defaults
 register_activation_hook(__FILE__, function () {
-    add_option('nwws_sync_enabled',      '0');
-    add_option('nwws_sync_products',     '1');
-    add_option('nwws_sync_orders',       '1');
-    add_option('nwws_sync_customers',    '1');
-    add_option('nwws_track_conversions', '1');
+    add_option('nwws_sync_enabled',           '0');
+    add_option('nwws_sync_products',          '1');
+    add_option('nwws_sync_orders',            '1');
+    add_option('nwws_sync_customers',         '1');
+    add_option('nwws_track_conversions',      '1');
+    add_option('nwws_push_url',               '');
+    add_option('nwws_push_key',               '');
+    add_option('nwws_sync_fields_prices',     '1');
+    add_option('nwws_sync_fields_cogs',       '1');
+    add_option('nwws_sync_fields_stock',      '1');
+    add_option('nwws_sync_fields_ean',        '1');
+    add_option('nwws_sync_fields_brand',      '1');
+    add_option('nwws_sync_fields_color',      '1');
+    add_option('nwws_sync_fields_size',       '1');
+    add_option('nwws_sync_fields_categories', '1');
 });
