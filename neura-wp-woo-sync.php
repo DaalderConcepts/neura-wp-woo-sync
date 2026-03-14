@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.1.1
+ * Version:      1.1.2
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.1.1');
+define('NWWS_VERSION',    '1.1.2');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -72,9 +72,20 @@ class Neura_GitHub_Updater {
         $data = json_decode(wp_remote_retrieve_body($response), true);
         if (!isset($data['tag_name'])) return null;
 
+        // Prefer a release asset ZIP (correct folder structure) over the raw zipball
+        $zip_url = $data['zipball_url'];
+        if (!empty($data['assets'])) {
+            foreach ($data['assets'] as $asset) {
+                if (str_ends_with($asset['name'], '.zip')) {
+                    $zip_url = $asset['browser_download_url'];
+                    break;
+                }
+            }
+        }
+
         $release = [
             'version'     => ltrim($data['tag_name'], 'v'),
-            'zip_url'     => $data['zipball_url'],
+            'zip_url'     => $zip_url,
             'body'        => $data['body'] ?? '',
             'published'   => $data['published_at'] ?? '',
         ];
@@ -126,13 +137,15 @@ class Neura_GitHub_Updater {
             return $response;
         }
 
-        // GitHub zips unpack naar owner-repo-sha/, hernoem naar plugin folder
+        // Release asset ZIPs unpack to neura-wp-woo-sync/ directly — ensure correct destination
         global $wp_filesystem;
-        $target = WP_PLUGIN_DIR . '/' . dirname($this->plugin_slug);
-        $wp_filesystem->move($result['destination'], $target, true);
-        $result['destination'] = $target;
+        $target = WP_PLUGIN_DIR . '/neura-wp-woo-sync';
+        if ($result['destination'] !== $target) {
+            $wp_filesystem->move($result['destination'], $target, true);
+            $result['destination'] = $target;
+        }
 
-        activate_plugin($this->plugin_slug);
+        activate_plugin('neura-wp-woo-sync/neura-wp-woo-sync.php');
         return $result;
     }
 }
