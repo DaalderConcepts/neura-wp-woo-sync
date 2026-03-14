@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.1.0
+ * Version:      1.1.1
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.1.0');
+define('NWWS_VERSION',    '1.1.1');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -467,6 +467,53 @@ class Neura_WooCommerce_Sync {
         register_rest_route('nwws/v1', '/products', array_merge($opts, ['methods' => 'GET', 'callback' => [$this, 'rest_get_products']]));
         register_rest_route('nwws/v1', '/orders',   array_merge($opts, ['methods' => 'GET', 'callback' => [$this, 'rest_get_orders']]));
         register_rest_route('nwws/v1', '/stats',    array_merge($opts, ['methods' => 'GET', 'callback' => [$this, 'rest_get_stats']]));
+
+        // Settings endpoint — authenticated by WP admin (Application Password)
+        register_rest_route('nwws/v1', '/settings', [
+            ['methods' => 'GET',  'callback' => [$this, 'rest_get_settings'],    'permission_callback' => [$this, 'rest_admin_check']],
+            ['methods' => 'POST', 'callback' => [$this, 'rest_update_settings'], 'permission_callback' => [$this, 'rest_admin_check']],
+        ]);
+    }
+
+    public function rest_admin_check(): bool {
+        return current_user_can('manage_woocommerce');
+    }
+
+    public function rest_get_settings(): \WP_REST_Response {
+        return rest_ensure_response([
+            'api_url'          => get_option('nwws_api_url', ''),
+            'api_key'          => get_option('nwws_api_key', '') ? '***' : '',
+            'sync_enabled'     => get_option('nwws_sync_enabled', '0') === '1',
+            'sync_products'    => get_option('nwws_sync_products', '1') === '1',
+            'sync_orders'      => get_option('nwws_sync_orders', '1') === '1',
+            'sync_customers'   => get_option('nwws_sync_customers', '1') === '1',
+            'track_conversions'=> get_option('nwws_track_conversions', '1') === '1',
+            'version'          => NWWS_VERSION,
+        ]);
+    }
+
+    public function rest_update_settings(\WP_REST_Request $request): \WP_REST_Response {
+        $body = $request->get_json_params();
+
+        $map = [
+            'api_url'           => 'nwws_api_url',
+            'api_key'           => 'nwws_api_key',
+            'sync_enabled'      => 'nwws_sync_enabled',
+            'sync_products'     => 'nwws_sync_products',
+            'sync_orders'       => 'nwws_sync_orders',
+            'sync_customers'    => 'nwws_sync_customers',
+            'track_conversions' => 'nwws_track_conversions',
+        ];
+
+        foreach ($map as $key => $option) {
+            if (!array_key_exists($key, $body)) continue;
+            $val = $body[$key];
+            // Booleans → '1'/'0'
+            if (is_bool($val)) $val = $val ? '1' : '0';
+            update_option($option, sanitize_text_field((string) $val));
+        }
+
+        return $this->rest_get_settings();
     }
 
     public function rest_permission_check(\WP_REST_Request $request): bool {
