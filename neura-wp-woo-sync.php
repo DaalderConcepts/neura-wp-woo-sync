@@ -11,7 +11,7 @@
  * Requires PHP: 7.4
  * WC requires at least: 5.0
  * WC tested up to: 9.0
- * Update URI:   https://github.com/neuramerce/neura-wp-woo-sync
+ * Update URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  */
 
 defined('ABSPATH') || exit;
