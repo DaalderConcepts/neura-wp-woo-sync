@@ -1,11 +1,11 @@
 <?php
 /**
  * Plugin Name:  Neura WooCommerce Sync
- * Plugin URI:   https://github.com/neuramerce/neura-wp-woo-sync
+ * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
  * Version:      1.1.0
- * Author:       Neuramerce
- * Author URI:   https://neuramerce.com
+ * Author:       Daalder Concepts
+ * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -28,7 +28,7 @@ define('NWWS_VERSION',    '1.1.0');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
-define('NWWS_GITHUB_OWNER', 'neuramerce');
+define('NWWS_GITHUB_OWNER', 'DaalderConcepts');
 define('NWWS_GITHUB_REPO',  'neura-wp-woo-sync');
 
 // ─────────────────────────────────────────────────────────────────────────────

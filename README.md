@@ -2,6 +2,8 @@
 
 WordPress plugin that syncs WooCommerce data (products, orders, COGS) with [Neuramerce](https://neuramerce.com) for accurate ROAS tracking and margin analysis.
 
+> **GitHub:** [DaalderConcepts/neura-wp-woo-sync](https://github.com/DaalderConcepts/neura-wp-woo-sync)
+
 ## Features
 
 - Real-time product & order sync to Neuramerce
