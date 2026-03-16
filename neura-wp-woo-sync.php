@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.2.0
+ * Version:      1.3.0
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.2.0');
+define('NWWS_VERSION',    '1.3.0');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -505,6 +505,10 @@ class Neura_WooCommerce_Sync {
         $items      = [];
         $total_cogs = 0;
 
+        // Prime product meta cache to avoid N+1 queries per order line item
+        $line_product_ids = array_filter(array_map(fn($item) => $item->get_product_id(), $order->get_items()));
+        if (!empty($line_product_ids)) update_meta_cache('post', array_unique(array_values($line_product_ids)));
+
         foreach ($order->get_items() as $item) {
             $product = $item->get_product();
             $cogs    = 0;
@@ -667,6 +671,10 @@ class Neura_WooCommerce_Sync {
             'status' => 'publish',
         ]);
 
+        // Prime meta cache -> eliminates N+1 queries for cogs/cogs_currency
+        $product_ids = array_map(fn($p) => $p->get_id(), $products);
+        if (!empty($product_ids)) update_meta_cache('post', $product_ids);
+
         $data = array_map(function ($product) {
             return [
                 'id'            => $product->get_id(),
@@ -699,13 +707,23 @@ class Neura_WooCommerce_Sync {
         return rest_ensure_response($data);
     }
 
+    private function is_hpos_enabled(): bool {
+        return class_exists('\Automattic\WooCommerce\Utilities\OrderUtil')
+            && \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+    }
+
     public function rest_get_stats(\WP_REST_Request $request): \WP_REST_Response {
         global $wpdb;
+        if ($this->is_hpos_enabled()) {
+            $total_revenue = $wpdb->get_var("SELECT SUM(total_amount) FROM {$wpdb->prefix}wc_orders WHERE status IN ('wc-completed','wc-processing') AND type = 'shop_order'");
+        } else {
+            $total_revenue = $wpdb->get_var("SELECT SUM(meta_value) FROM {$wpdb->postmeta} WHERE meta_key = '_order_total'");
+        }
         return rest_ensure_response([
             'total_products'      => wp_count_posts('product')->publish,
             'total_orders'        => wc_orders_count('completed'),
-            'total_revenue'       => $wpdb->get_var("SELECT SUM(meta_value) FROM {$wpdb->postmeta} WHERE meta_key = '_order_total'"),
-            'products_with_cogs'  => $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_cogs' AND meta_value != ''"),
+            'total_revenue'       => (float) ($total_revenue ?? 0),
+            'products_with_cogs'  => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_cogs' AND meta_value != ''"),
         ]);
     }
 
@@ -745,24 +763,34 @@ class Neura_WooCommerce_Sync {
         check_ajax_referer('nwws_nonce', 'nonce');
         @set_time_limit(300);
 
-        $products = wc_get_products(['limit' => -1, 'status' => 'publish']);
-        foreach ($products as $product) {
-            $this->sync_product($product->get_id());
-        }
+        $page = 1; $batch = 50; $count = 0;
+        do {
+            $products = wc_get_products(['limit' => $batch, 'page' => $page, 'status' => 'publish']);
+            foreach ($products as $product) {
+                $this->sync_product($product->get_id());
+                $count++;
+            }
+            $page++;
+        } while (count($products) === $batch);
 
-        wp_send_json_success(count($products) . ' producten gesynchroniseerd.');
+        wp_send_json_success($count . ' producten gesynchroniseerd.');
     }
 
     public function ajax_sync_all_orders(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
         @set_time_limit(300);
 
-        $orders = wc_get_orders(['limit' => -1]);
-        foreach ($orders as $order) {
-            $this->sync_order($order->get_id());
-        }
+        $page = 1; $batch = 50; $count = 0;
+        do {
+            $orders = wc_get_orders(['limit' => $batch, 'page' => $page]);
+            foreach ($orders as $order) {
+                $this->sync_order($order->get_id());
+                $count++;
+            }
+            $page++;
+        } while (count($orders) === $batch);
 
-        wp_send_json_success(count($orders) . ' orders gesynchroniseerd.');
+        wp_send_json_success($count . ' orders gesynchroniseerd.');
     }
 
     public function ajax_test_push(): void {
@@ -796,12 +824,18 @@ class Neura_WooCommerce_Sync {
         check_ajax_referer('nwws_nonce', 'nonce');
         global $wpdb;
 
+        if ($this->is_hpos_enabled()) {
+            $orders_synced = (int) $wpdb->get_var("SELECT COUNT(DISTINCT order_id) FROM {$wpdb->prefix}wc_orders_meta WHERE meta_key = '_nwws_last_sync'");
+        } else {
+            $orders_synced = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync' AND post_id IN (SELECT ID FROM {$wpdb->posts} WHERE post_type = 'shop_order')");
+        }
+
         wp_send_json_success([
             'total_products'      => wp_count_posts('product')->publish,
-            'products_synced'     => $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync'"),
-            'products_with_cogs'  => $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_cogs' AND meta_value != ''"),
+            'products_synced'     => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync'"),
+            'products_with_cogs'  => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_cogs' AND meta_value != ''"),
             'total_orders'        => wc_orders_count('all'),
-            'orders_synced'       => $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync' AND post_id IN (SELECT ID FROM {$wpdb->posts} WHERE post_type = 'shop_order')"),
+            'orders_synced'       => $orders_synced,
         ]);
     }
 
@@ -861,3 +895,22 @@ register_activation_hook(__FILE__, function () {
     add_option('nwws_sync_fields_size',       '1');
     add_option('nwws_sync_fields_categories', '1');
 });
+
+// Uninstall cleanup
+register_uninstall_hook(__FILE__, 'nwws_uninstall');
+
+function nwws_uninstall(): void {
+    $options = [
+        'nwws_sync_enabled', 'nwws_sync_products', 'nwws_sync_orders',
+        'nwws_sync_customers', 'nwws_track_conversions',
+        'nwws_api_url', 'nwws_api_key', 'nwws_push_url', 'nwws_push_key',
+        'nwws_sync_fields_prices', 'nwws_sync_fields_cogs', 'nwws_sync_fields_stock',
+        'nwws_sync_fields_ean', 'nwws_sync_fields_brand', 'nwws_sync_fields_color',
+        'nwws_sync_fields_size', 'nwws_sync_fields_categories',
+    ];
+    foreach ($options as $opt) delete_option($opt);
+    // Remove post meta added by this plugin
+    delete_post_meta_by_key('_nwws_last_sync');
+    delete_post_meta_by_key('_cogs');
+    delete_post_meta_by_key('_cogs_currency');
+}
