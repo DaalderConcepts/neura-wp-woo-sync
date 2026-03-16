@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.3.1
+ * Version:      1.3.2
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.3.1');
+define('NWWS_VERSION',    '1.3.2');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -253,10 +253,11 @@ class Neura_WooCommerce_Sync {
             update_option('nwws_sync_fields_cogs',         isset($_POST['nwws_sync_fields_cogs'])         ? '1' : '0');
             update_option('nwws_sync_fields_stock',        isset($_POST['nwws_sync_fields_stock'])        ? '1' : '0');
             update_option('nwws_sync_fields_ean',          isset($_POST['nwws_sync_fields_ean'])          ? '1' : '0');
-            update_option('nwws_sync_fields_brand',        isset($_POST['nwws_sync_fields_brand'])        ? '1' : '0');
-            update_option('nwws_sync_fields_color',        isset($_POST['nwws_sync_fields_color'])        ? '1' : '0');
-            update_option('nwws_sync_fields_size',         isset($_POST['nwws_sync_fields_size'])         ? '1' : '0');
             update_option('nwws_sync_fields_categories',   isset($_POST['nwws_sync_fields_categories'])   ? '1' : '0');
+            $selected_attrs = isset($_POST['nwws_sync_attr']) && is_array($_POST['nwws_sync_attr'])
+                ? implode(',', array_map('sanitize_key', $_POST['nwws_sync_attr']))
+                : '';
+            update_option('nwws_sync_attrs', $selected_attrs);
 
             echo '<div class="notice notice-success"><p>Instellingen opgeslagen!</p></div>';
         }
@@ -450,14 +451,16 @@ class Neura_WooCommerce_Sync {
             $data['ean'] = $ean ?: null;
         }
 
-        // Brand / Color / Size from WooCommerce attributes
-        $sync_brand = get_option('nwws_sync_fields_brand', '1') === '1';
-        $sync_color = get_option('nwws_sync_fields_color', '1') === '1';
-        $sync_size  = get_option('nwws_sync_fields_size',  '1') === '1';
+        // Brand / Color / Size from selected WooCommerce attribute taxonomies
+        $sync_attrs_raw  = get_option('nwws_sync_attrs', '');
+        $sync_attrs_list = $sync_attrs_raw !== ''
+            ? array_filter(array_map('trim', explode(',', $sync_attrs_raw)))
+            : null; // null = legacy mode (sync all by pattern)
 
-        if ($sync_brand || $sync_color || $sync_size) {
+        if ($sync_attrs_list !== null && !empty($sync_attrs_list)) {
             $brand = $color = $size = null;
             foreach ($product->get_attributes() as $slug => $attribute) {
+                if (!in_array($slug, $sync_attrs_list, true)) continue;
                 if ($attribute->is_taxonomy()) {
                     $label   = strtolower(wc_attribute_label($slug));
                     $options = wc_get_product_terms($product_id, $slug, ['fields' => 'names']);
@@ -474,9 +477,33 @@ class Neura_WooCommerce_Sync {
                     $size = $value ?: null;
                 }
             }
-            if ($sync_brand) $data['brand'] = $brand;
-            if ($sync_color) $data['color'] = $color;
-            if ($sync_size)  $data['size']  = $size;
+            $data['brand'] = $brand;
+            $data['color'] = $color;
+            $data['size']  = $size;
+        } elseif ($sync_attrs_list === null) {
+            // Legacy: sync brand/color/size via individual options
+            $sync_brand = get_option('nwws_sync_fields_brand', '1') === '1';
+            $sync_color = get_option('nwws_sync_fields_color', '1') === '1';
+            $sync_size  = get_option('nwws_sync_fields_size',  '1') === '1';
+            if ($sync_brand || $sync_color || $sync_size) {
+                $brand = $color = $size = null;
+                foreach ($product->get_attributes() as $slug => $attribute) {
+                    if ($attribute->is_taxonomy()) {
+                        $label   = strtolower(wc_attribute_label($slug));
+                        $options = wc_get_product_terms($product_id, $slug, ['fields' => 'names']);
+                        $value   = implode(', ', $options);
+                    } else {
+                        $label   = strtolower($attribute->get_name());
+                        $value   = implode(', ', $attribute->get_options());
+                    }
+                    if (preg_match('/brand|merk|fabrikant|manufacturer/', $label)) $brand = $value ?: null;
+                    elseif (preg_match('/colou?r|kleur/', $label))                 $color = $value ?: null;
+                    elseif (preg_match('/size|maat|afmeting|formaat/', $label))    $size  = $value ?: null;
+                }
+                if ($sync_brand) $data['brand'] = $brand;
+                if ($sync_color) $data['color'] = $color;
+                if ($sync_size)  $data['size']  = $size;
+            }
         }
 
         // Categories
