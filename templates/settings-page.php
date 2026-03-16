@@ -23,6 +23,20 @@ $sync_fields_brand      = get_option('nwws_sync_fields_brand',      '1') === '1'
 $sync_fields_color      = get_option('nwws_sync_fields_color',      '1') === '1';
 $sync_fields_size       = get_option('nwws_sync_fields_size',       '1') === '1';
 $sync_fields_categories = get_option('nwws_sync_fields_categories', '1') === '1';
+
+// Enabled attribute taxonomies (comma-separated slugs)
+$sync_attrs_raw  = get_option('nwws_sync_attrs', 'product_brand');
+$sync_attrs_list = array_filter(array_map('trim', explode(',', $sync_attrs_raw)));
+
+// All attribute taxonomies for the checklist (exclude core taxonomies)
+$core_taxonomies = ['product_cat', 'product_tag', 'product_type', 'product_visibility', 'product_shipping_class'];
+$attr_taxonomies = [];
+foreach (get_object_taxonomies('product', 'objects') as $slug => $obj) {
+    if (!in_array($slug, $core_taxonomies, true)) {
+        $attr_taxonomies[$slug] = $obj->label . ' <code>(' . $slug . ')</code>';
+    }
+}
+asort($attr_taxonomies);
 ?>
 
 <div class="wrap nwws-settings">
@@ -137,14 +151,27 @@ $sync_fields_categories = get_option('nwws_sync_fields_categories', '1') === '1'
                                 <label><input type="checkbox" name="nwws_sync_fields_cogs"       value="1" <?php checked($sync_fields_cogs); ?>>       <strong>COGS</strong> — inkoopprijs en valuta</label><br>
                                 <label><input type="checkbox" name="nwws_sync_fields_stock"      value="1" <?php checked($sync_fields_stock); ?>>      <strong>Voorraad</strong> — stockstatus en -hoeveelheid</label><br>
                                 <label><input type="checkbox" name="nwws_sync_fields_ean"        value="1" <?php checked($sync_fields_ean); ?>>        <strong>EAN / GTIN / Barcode</strong> — global_unique_id of meta veld</label><br>
-                                <label><input type="checkbox" name="nwws_sync_fields_brand"      value="1" <?php checked($sync_fields_brand); ?>>      <strong>Merk</strong> — brand/merk attribuut</label><br>
-                                <label><input type="checkbox" name="nwws_sync_fields_color"      value="1" <?php checked($sync_fields_color); ?>>      <strong>Kleur</strong> — color/kleur attribuut</label><br>
-                                <label><input type="checkbox" name="nwws_sync_fields_size"       value="1" <?php checked($sync_fields_size); ?>>       <strong>Maat</strong> — size/maat attribuut</label><br>
                                 <label><input type="checkbox" name="nwws_sync_fields_categories" value="1" <?php checked($sync_fields_categories); ?>> <strong>Categorieën</strong> — product categorienamen</label>
                             </fieldset>
                             <p class="description">SKU, naam en permalink worden altijd gesynchroniseerd.</p>
                         </td>
                     </tr>
+                    <?php if (!empty($attr_taxonomies)) : ?>
+                    <tr>
+                        <th scope="row">Attribuut taxonomieën</th>
+                        <td>
+                            <fieldset>
+                                <?php foreach ($attr_taxonomies as $slug => $label) : ?>
+                                    <label>
+                                        <input type="checkbox" name="nwws_sync_attr[]" value="<?php echo esc_attr($slug); ?>" <?php checked(in_array($slug, $sync_attrs_list, true)); ?>>
+                                        <?php echo wp_kses($label, ['code' => []]); ?>
+                                    </label><br>
+                                <?php endforeach; ?>
+                            </fieldset>
+                            <p class="description">Geselecteerde attributen worden gesynchroniseerd als Merk, Kleur of Maat op basis van de attribuutnaam.</p>
+                        </td>
+                    </tr>
+                    <?php endif; ?>
                 </table>
 
                 <?php submit_button('Instellingen Opslaan', 'primary', 'nwws_save_settings'); ?>
