@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.3.2
+ * Version:      1.3.3
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.3.2');
+define('NWWS_VERSION',    '1.3.3');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -539,20 +539,20 @@ class Neura_WooCommerce_Sync {
 
     public function sync_new_order(int $order_id): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_orders') !== '1') return;
-        $this->sync_order($order_id);
+        try { $this->sync_order($order_id); } catch (\Throwable $e) { error_log('NWWS sync_new_order error: ' . $e->getMessage()); }
     }
 
     public function sync_order_update(int $order_id): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_orders') !== '1') return;
-        $this->sync_order($order_id);
+        try { $this->sync_order($order_id); } catch (\Throwable $e) { error_log('NWWS sync_order_update error: ' . $e->getMessage()); }
     }
 
     public function sync_order_status_change(int $order_id, string $old_status, string $new_status, \WC_Order $order): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_orders') !== '1') return;
-        $this->sync_order($order_id);
+        try { $this->sync_order($order_id); } catch (\Throwable $e) { error_log('NWWS sync_order_status error: ' . $e->getMessage()); }
 
         if (get_option('nwws_track_conversions') === '1' && $new_status === 'completed') {
-            $this->track_conversion($order);
+            try { $this->track_conversion($order); } catch (\Throwable $e) { error_log('NWWS track_conversion error: ' . $e->getMessage()); }
         }
     }
 
@@ -621,8 +621,6 @@ class Neura_WooCommerce_Sync {
         ];
 
         $this->send_to_api('orders', $data, 'POST');
-        $order->update_meta_data('_nwws_last_sync', current_time('timestamp'));
-        $order->save();
     }
 
     private function track_conversion(\WC_Order $order): void {
@@ -907,20 +905,16 @@ class Neura_WooCommerce_Sync {
 
         if (empty($api_url) || empty($api_key)) return false;
 
-        $response = wp_remote_request(trailingslashit($api_url) . $endpoint, [
-            'method'  => $method,
-            'headers' => ['Content-Type' => 'application/json', 'X-API-Key' => $api_key],
-            'body'    => wp_json_encode($data),
-            'timeout' => 30,
+        // Non-blocking: fire-and-forget so checkout/save actions are never delayed.
+        wp_remote_request(trailingslashit($api_url) . $endpoint, [
+            'method'   => $method,
+            'headers'  => ['Content-Type' => 'application/json', 'X-API-Key' => $api_key],
+            'body'     => wp_json_encode($data),
+            'timeout'  => 5,
+            'blocking' => false,
         ]);
 
-        if (is_wp_error($response)) {
-            error_log('NWWS API Error: ' . $response->get_error_message());
-            return false;
-        }
-
-        $code = wp_remote_retrieve_response_code($response);
-        return $code >= 200 && $code < 300;
+        return true;
     }
 }
 
