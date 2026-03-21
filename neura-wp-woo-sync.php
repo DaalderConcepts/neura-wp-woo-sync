@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.3.2
+ * Version:      1.3.3
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,11 +24,18 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.3.2');
+define('NWWS_VERSION',    '1.3.3');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
 define('NWWS_GITHUB_OWNER', 'DaalderConcepts');
+// Declare HPOS (Custom Order Tables) compatibility
+add_action('before_woocommerce_init', function () {
+    if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', NWWS_PLUGIN_FILE, true);
+    }
+});
+
 define('NWWS_GITHUB_REPO',  'neura-wp-woo-sync');
 
 // Neuramerce Migrator
@@ -189,6 +196,9 @@ class Neura_WooCommerce_Sync {
         add_action('woocommerce_variation_options_pricing',[$this, 'add_variation_cogs_field'], 10, 3);
         add_action('woocommerce_save_product_variation',   [$this, 'save_variation_cogs_field'], 10, 2);
 
+        // Frontend chat widget + cart tracking
+        add_action('wp_enqueue_scripts', [$this, 'enqueue_frontend_assets']);
+
         // REST API
         add_action('rest_api_init', [$this, 'register_rest_routes']);
         add_action('rest_api_init', ['NWWS_Migrator_API', 'register_routes']);
@@ -236,14 +246,153 @@ class Neura_WooCommerce_Sync {
         ]);
     }
 
+    public function enqueue_frontend_assets(): void {
+        if (get_option('nwws_chat_enabled', '0') !== '1') return;
+
+        $inbox_key = sanitize_text_field(get_option('nwws_chat_inbox_key', ''));
+        if (empty($inbox_key)) return;
+
+        // Base URL: strip /api/... suffix from nwws_api_url if present, or use fallback
+        $raw_url  = get_option('nwws_api_url', '');
+        $base_url = $raw_url
+            ? rtrim(preg_replace('#/api/.*$#', '', $raw_url), '/')
+            : 'https://app.neuramerce.com';
+
+        // Current cart data (safe for JS output)
+        $cart_items = [];
+        $cart_total = 0.0;
+        if (function_exists('WC') && WC()->cart && !is_admin()) {
+            foreach (WC()->cart->get_cart() as $item) {
+                $product     = $item['data'] ?? null;
+                $cart_items[] = [
+                    'product_id' => (int) $item['product_id'],
+                    'name'       => $product ? wp_strip_all_tags($product->get_name()) : '',
+                    'quantity'   => (int) $item['quantity'],
+                    'price'      => $product ? (float) wc_get_price_including_tax($product) : 0.0,
+                ];
+            }
+            $cart_total = (float) WC()->cart->get_cart_contents_total();
+        }
+
+        // Register a dummy script handle so we can attach inline JS
+        wp_register_script('nwws-chat', false, [], NWWS_VERSION, true);
+        wp_enqueue_script('nwws-chat');
+
+        $inbox_key_js = wp_json_encode($inbox_key);
+        $base_url_js  = wp_json_encode($base_url);
+        $cart_js      = wp_json_encode(['items' => $cart_items, 'total' => $cart_total]);
+
+        $inline = <<<JS
+(function () {
+  var inboxKey = {$inbox_key_js};
+  var base     = {$base_url_js};
+  var cart     = {$cart_js};
+
+  // ── Inject widget loader ──────────────────────────────────────────────────
+  var s = document.createElement('script');
+  s.src   = base + '/widget-loader.js?key=' + encodeURIComponent(inboxKey);
+  s.defer = true;
+  document.body.appendChild(s);
+
+  // ── Cart tracking helper ──────────────────────────────────────────────────
+  function sendCartUpdate(cartData) {
+    var fp = '';
+    try { fp = localStorage.getItem('nmrc_fp') || ''; } catch (e) {}
+    if (!fp) {
+      // Fingerprint not yet set — retry once after widget has initialised
+      setTimeout(function () { sendCartUpdate(cartData); }, 1500);
+      return;
+    }
+    fetch(base + '/api/v1/inbox/track', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        event:       'cart_update',
+        fingerprint: fp,
+        inboxKey:    inboxKey,
+        data:        { items: cartData.items, total: cartData.total }
+      })
+    }).catch(function () {});
+  }
+
+  // ── Send initial cart state after widget loads ────────────────────────────
+  s.addEventListener('load', function () {
+    if (cart.items.length > 0 || cart.total > 0) {
+      setTimeout(function () { sendCartUpdate(cart); }, 1200);
+    }
+  });
+
+  // ── Listen for live WooCommerce cart events ───────────────────────────────
+  // WooCommerce fires these jQuery events on document.body
+  document.addEventListener('DOMContentLoaded', function () {
+    if (typeof jQuery === 'undefined') return;
+
+    jQuery(document.body).on(
+      'added_to_cart removed_from_cart updated_cart_totals wc_fragments_refreshed',
+      function () {
+        // Fetch fresh cart from WooCommerce AJAX endpoint
+        var ajaxUrl = (typeof wc_cart_fragments_params !== 'undefined')
+          ? wc_cart_fragments_params.wc_ajax_url
+          : (typeof woocommerce_params !== 'undefined' ? woocommerce_params.ajax_url : '/');
+
+        if (!ajaxUrl || ajaxUrl === '/') return;
+
+        jQuery.post(
+          ajaxUrl.replace('%%endpoint%%', 'get_refreshed_fragments'),
+          {},
+          function (data) {
+            if (data && data.cart_hash !== undefined) {
+              // Re-fetch cart totals via a separate lightweight endpoint
+              fetch(base + '/api/v1/inbox/widget-cart?inboxKey=' + encodeURIComponent(inboxKey), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                // Pass WC session cookie automatically (same origin if widget is on same domain)
+              }).then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (d) { if (d && d.cart) sendCartUpdate(d.cart); })
+                .catch(function () {
+                  // Fallback: send total from page if available
+                  var totalEl = document.querySelector('.cart-subtotal .woocommerce-Price-amount');
+                  var totalText = totalEl ? totalEl.textContent.replace(/[^0-9,.]/g, '').replace(',', '.') : '0';
+                  sendCartUpdate({ items: [], total: parseFloat(totalText) || 0 });
+                });
+            }
+          }
+        );
+      }
+    );
+
+    // Also track on add-to-cart button click (fires before AJAX completes)
+    jQuery(document.body).on('click', '.add_to_cart_button, .single_add_to_cart_button', function () {
+      // Brief delay so WooCommerce AJAX has finished
+      setTimeout(function () {
+        var totalEl = document.querySelector('.cart-subtotal .woocommerce-Price-amount, .order-total .woocommerce-Price-amount');
+        if (totalEl) {
+          var total = parseFloat(totalEl.textContent.replace(/[^0-9,.]/g, '').replace(',', '.')) || 0;
+          sendCartUpdate({ items: [], total: total });
+        }
+      }, 800);
+    });
+  });
+})();
+JS;
+
+        wp_add_inline_script('nwws-chat', $inline);
+    }
+
     public function render_settings_page(): void {
         if (isset($_POST['nwws_save_settings'])) {
             check_admin_referer('nwws_settings');
 
             update_option('nwws_api_url',                  sanitize_text_field($_POST['nwws_api_url']));
             update_option('nwws_api_key',                  sanitize_text_field($_POST['nwws_api_key']));
-            update_option('nwws_push_url',                 esc_url_raw($_POST['nwws_push_url'] ?? ''));
-            update_option('nwws_push_key',                 sanitize_text_field($_POST['nwws_push_key'] ?? ''));
+            $saved_push_url = esc_url_raw($_POST['nwws_push_url'] ?? '');
+            update_option('nwws_push_url', $saved_push_url);
+            update_option('nwws_push_key', sanitize_text_field($_POST['nwws_push_key'] ?? ''));
+            // Auto-extract workspace ID from push URL query string (?workspace=...)
+            $parsed_qs = [];
+            parse_str(parse_url($saved_push_url, PHP_URL_QUERY) ?? '', $parsed_qs);
+            $extracted_ws = sanitize_text_field($parsed_qs['workspace'] ?? $_POST['nwws_workspace_id'] ?? '');
+            if (!empty($extracted_ws)) update_option('nwws_workspace_id', $extracted_ws);
             update_option('nwws_sync_enabled',             isset($_POST['nwws_sync_enabled'])             ? '1' : '0');
             update_option('nwws_sync_products',            isset($_POST['nwws_sync_products'])            ? '1' : '0');
             update_option('nwws_sync_orders',              isset($_POST['nwws_sync_orders'])              ? '1' : '0');
@@ -258,6 +407,10 @@ class Neura_WooCommerce_Sync {
                 ? implode(',', array_map('sanitize_key', $_POST['nwws_sync_attr']))
                 : '';
             update_option('nwws_sync_attrs', $selected_attrs);
+
+            // Chat widget
+            update_option('nwws_chat_enabled',   isset($_POST['nwws_chat_enabled'])   ? '1' : '0');
+            update_option('nwws_chat_inbox_key', sanitize_text_field($_POST['nwws_chat_inbox_key'] ?? ''));
 
             echo '<div class="notice notice-success"><p>Instellingen opgeslagen!</p></div>';
         }
@@ -361,12 +514,16 @@ class Neura_WooCommerce_Sync {
 
     public function sync_new_product(int $product_id): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_products') !== '1') return;
-        $this->sync_product($product_id);
+        if (!wp_next_scheduled('nwws_sync_product_bg', [$product_id])) {
+            wp_schedule_single_event(time(), 'nwws_sync_product_bg', [$product_id]);
+        }
     }
 
     public function sync_product_update(int $product_id): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_products') !== '1') return;
-        $this->sync_product($product_id);
+        if (!wp_next_scheduled('nwws_sync_product_bg', [$product_id])) {
+            wp_schedule_single_event(time(), 'nwws_sync_product_bg', [$product_id]);
+        }
     }
 
     private function sync_product(int $product_id): void {
@@ -539,20 +696,28 @@ class Neura_WooCommerce_Sync {
 
     public function sync_new_order(int $order_id): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_orders') !== '1') return;
-        $this->sync_order($order_id);
+        if (doing_action('nwws_sync_order_bg')) return;
+        if (!wp_next_scheduled('nwws_sync_order_bg', [$order_id])) {
+            wp_schedule_single_event(time(), 'nwws_sync_order_bg', [$order_id]);
+        }
     }
 
     public function sync_order_update(int $order_id): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_orders') !== '1') return;
-        $this->sync_order($order_id);
+        if (doing_action('nwws_sync_order_bg')) return;
+        if (!wp_next_scheduled('nwws_sync_order_bg', [$order_id])) {
+            wp_schedule_single_event(time(), 'nwws_sync_order_bg', [$order_id]);
+        }
     }
 
     public function sync_order_status_change(int $order_id, string $old_status, string $new_status, \WC_Order $order): void {
         if (get_option('nwws_sync_enabled') !== '1' || get_option('nwws_sync_orders') !== '1') return;
-        $this->sync_order($order_id);
+        try { $this->sync_order($order_id); } catch (\Throwable $e) { error_log('NWWS sync_order_status error: ' . $e->getMessage()); }
 
         if (get_option('nwws_track_conversions') === '1' && $new_status === 'completed') {
-            $this->track_conversion($order);
+            if (!wp_next_scheduled('nwws_track_conversion_bg', [$order_id])) {
+                wp_schedule_single_event(time(), 'nwws_track_conversion_bg', [$order_id]);
+            }
         }
     }
 
@@ -588,7 +753,7 @@ class Neura_WooCommerce_Sync {
         }
 
         $revenue       = (float) $order->get_total();
-        $profit        = $revenue - $total_cogs - (float) $order->get_shipping_total();
+        $profit        = $revenue - $total_cogs;
         $profit_margin = $revenue > 0 ? ($profit / $revenue) * 100 : 0;
 
         $data = [
@@ -610,7 +775,7 @@ class Neura_WooCommerce_Sync {
             'customer_name'   => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
             'billing_country' => $order->get_billing_country(),
             'payment_method'  => $order->get_payment_method_title(),
-            'created_at'      => $order->get_date_created()->format('Y-m-d H:i:s'),
+            'created_at'      => $order->get_date_created() ? $order->get_date_created()->format('Y-m-d H:i:s') : null,
             'updated_at'      => current_time('mysql'),
             'utm_source'      => $order->get_meta('_utm_source'),
             'utm_medium'      => $order->get_meta('_utm_medium'),
@@ -621,8 +786,6 @@ class Neura_WooCommerce_Sync {
         ];
 
         $this->send_to_api('orders', $data, 'POST');
-        $order->update_meta_data('_nwws_last_sync', current_time('timestamp'));
-        $order->save();
     }
 
     private function track_conversion(\WC_Order $order): void {
@@ -907,20 +1070,16 @@ class Neura_WooCommerce_Sync {
 
         if (empty($api_url) || empty($api_key)) return false;
 
-        $response = wp_remote_request(trailingslashit($api_url) . $endpoint, [
-            'method'  => $method,
-            'headers' => ['Content-Type' => 'application/json', 'X-API-Key' => $api_key],
-            'body'    => wp_json_encode($data),
-            'timeout' => 30,
+        // Non-blocking: fire-and-forget so checkout/save actions are never delayed.
+        wp_remote_request(trailingslashit($api_url) . $endpoint, [
+            'method'   => $method,
+            'headers'  => ['Content-Type' => 'application/json', 'X-API-Key' => $api_key],
+            'body'     => wp_json_encode($data),
+            'timeout'  => 5,
+            'blocking' => false,
         ]);
 
-        if (is_wp_error($response)) {
-            error_log('NWWS API Error: ' . $response->get_error_message());
-            return false;
-        }
-
-        $code = wp_remote_retrieve_response_code($response);
-        return $code >= 200 && $code < 300;
+        return true;
     }
 }
 
@@ -952,7 +1111,193 @@ register_activation_hook(__FILE__, function () {
     add_option('nwws_sync_fields_color',      '1');
     add_option('nwws_sync_fields_size',       '1');
     add_option('nwws_sync_fields_categories', '1');
+    add_option('nwws_chat_enabled',           '0');
+    add_option('nwws_chat_inbox_key',         '');
 });
+
+// =============================================================================
+// NEURAMERCE SYNC POLLING (WP Cron — elke minuut)
+//
+// Omdat Railway's servers geblokkeerd worden door Cloudflare op nomadfire.shop,
+// draait de sync omgekeerd: de WP plugin pollt Neuramerce voor sync-aanvragen.
+// Stroom:
+//   1. Dashboard "Nu synchroniseren" → POST /api/woocommerce/request-sync
+//   2. Plugin pollt GET /api/v1/inventory/woocommerce/sync-check elke minuut
+//   3. Als syncRequested=true: plugin haalt WC-data op en pusht naar Neuramerce
+//   4. Plugin meldt klaar via POST /api/v1/inventory/woocommerce/push {type:'done'}
+// =============================================================================
+
+// Elke-minuut schedule registreren
+add_filter('cron_schedules', function (array $schedules): array {
+    if (!isset($schedules['nwws_every_minute'])) {
+        $schedules['nwws_every_minute'] = [
+            'interval' => 60,
+            'display'  => 'Elke minuut (Neuramerce sync check)',
+        ];
+    }
+    return $schedules;
+});
+
+// Cron event plannen bij activatie
+register_activation_hook(__FILE__, function () {
+    if (!wp_next_scheduled('nwws_poll_sync')) {
+        wp_schedule_event(time(), 'nwws_every_minute', 'nwws_poll_sync');
+    }
+});
+
+// Cron event verwijderen bij deactivatie
+register_deactivation_hook(__FILE__, function () {
+    $timestamp = wp_next_scheduled('nwws_poll_sync');
+    if ($timestamp) wp_unschedule_event($timestamp, 'nwws_poll_sync');
+});
+
+// Cron-callback: check of Neuramerce een sync wil
+add_action('nwws_poll_sync', 'nwws_run_poll_sync');
+
+function nwws_run_poll_sync(): void {
+    $push_url  = get_option('nwws_push_url', '');  // webhook base URL (bijv. https://app.neuramerce.com/api/v1/inventory/woocommerce)
+    $push_key  = get_option('nwws_push_key', '');
+    $workspace = get_option('nwws_workspace_id', '');
+
+    if (empty($push_url) || empty($push_key) || empty($workspace)) return;
+
+    // Leid de base URL af (bijv. https://app.neuramerce.com)
+    $app_base = rtrim(preg_replace('#/api/v1/inventory/woocommerce.*#', '', $push_url), '/');
+    if (empty($app_base)) return;
+
+    // 1. Check of er een sync aangevraagd is
+    $check_url = $app_base . '/api/v1/inventory/woocommerce/sync-check?workspace=' . urlencode($workspace);
+    $response  = wp_remote_get($check_url, [
+        'headers' => ['X-API-Key' => $push_key],
+        'timeout' => 10,
+    ]);
+
+    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) return;
+
+    $data = json_decode(wp_remote_retrieve_body($response), true);
+    if (empty($data['syncRequested'])) return;
+
+    // 2. Sync uitvoeren
+    $push_endpoint = $app_base . '/api/v1/inventory/woocommerce/push?workspace=' . urlencode($workspace);
+    $products_count = 0;
+    $orders_count   = 0;
+
+    // 2a. Producten ophalen en pushen in batches van 50
+    if (get_option('nwws_sync_products', '1') === '1') {
+        $page = 1; $batch = 50;
+        do {
+            $products = wc_get_products([
+                'limit'  => $batch,
+                'page'   => $page,
+                'status' => 'publish',
+                'return' => 'objects',
+            ]);
+
+            if (empty($products)) break;
+
+            $payload = [];
+            foreach ($products as $product) {
+                $data_store = $product->get_data();
+                $attrs = [];
+                foreach ($product->get_attributes() as $attr_key => $attr) {
+                    $attrs[] = [
+                        'name'    => wc_attribute_label($attr_key),
+                        'options' => $attr->get_options() ?: [$attr->get_option()],
+                    ];
+                }
+                $payload[] = [
+                    'id'            => $product->get_id(),
+                    'sku'           => $product->get_sku(),
+                    'name'          => $product->get_name(),
+                    'status'        => $product->get_status(),
+                    'regular_price' => $product->get_regular_price(),
+                    'sale_price'    => $product->get_sale_price(),
+                    'permalink'     => get_permalink($product->get_id()),
+                    'images'        => array_values(array_map(
+                        fn($img_id) => ['src' => wp_get_attachment_url($img_id)],
+                        array_filter([$product->get_image_id()])
+                    )),
+                    'categories'    => array_values(array_map(
+                        fn($term) => ['name' => $term->name],
+                        get_the_terms($product->get_id(), 'product_cat') ?: []
+                    )),
+                    'attributes'    => $attrs,
+                    'meta_data'     => [
+                        ['key' => '_cogs',          'value' => get_post_meta($product->get_id(), '_cogs', true)],
+                        ['key' => '_cogs_currency', 'value' => get_post_meta($product->get_id(), '_cogs_currency', true)],
+                        ['key' => '_ean',           'value' => get_post_meta($product->get_id(), '_ean', true)],
+                    ],
+                ];
+            }
+
+            wp_remote_post($push_endpoint, [
+                'headers'     => ['Content-Type' => 'application/json', 'X-API-Key' => $push_key],
+                'body'        => wp_json_encode(['type' => 'products', 'products' => $payload]),
+                'timeout'     => 30,
+                'data_format' => 'body',
+            ]);
+
+            $products_count += count($products);
+            $page++;
+        } while (count($products) === $batch);
+    }
+
+    // 2b. Orders ophalen en pushen in batches van 50
+    if (get_option('nwws_sync_orders', '1') === '1') {
+        $page = 1; $batch = 50;
+        do {
+            $orders = wc_get_orders(['limit' => $batch, 'page' => $page, 'return' => 'objects']);
+            if (empty($orders)) break;
+
+            $payload = [];
+            foreach ($orders as $order) {
+                $items = [];
+                foreach ($order->get_items() as $item) {
+                    $items[] = [
+                        'sku'      => $item->get_product() ? $item->get_product()->get_sku() : '',
+                        'name'     => $item->get_name(),
+                        'quantity' => $item->get_quantity(),
+                        'price'    => $order->get_item_subtotal($item, false, true),
+                    ];
+                }
+                $payload[] = [
+                    'id'       => $order->get_id(),
+                    'status'   => $order->get_status(),
+                    'total'    => $order->get_total(),
+                    'billing'  => [
+                        'first_name' => $order->get_billing_first_name(),
+                        'last_name'  => $order->get_billing_last_name(),
+                        'email'      => $order->get_billing_email(),
+                        'country'    => $order->get_billing_country(),
+                    ],
+                    'shipping' => ['country' => $order->get_shipping_country()],
+                    'line_items' => $items,
+                ];
+            }
+
+            wp_remote_post($push_endpoint, [
+                'headers'     => ['Content-Type' => 'application/json', 'X-API-Key' => $push_key],
+                'body'        => wp_json_encode(['type' => 'orders', 'orders' => $payload]),
+                'timeout'     => 30,
+                'data_format' => 'body',
+            ]);
+
+            $orders_count += count($orders);
+            $page++;
+        } while (count($orders) === $batch);
+    }
+
+    // 3. Sync afmelden bij Neuramerce
+    wp_remote_post($push_endpoint, [
+        'headers'     => ['Content-Type' => 'application/json', 'X-API-Key' => $push_key],
+        'body'        => wp_json_encode([
+            'type'  => 'done',
+            'stats' => ['products' => $products_count, 'orders' => $orders_count],
+        ]),
+        'timeout'     => 10,
+        'data_format' => 'body',
+    ]);
+}
 
 // Uninstall cleanup
 register_uninstall_hook(__FILE__, 'nwws_uninstall');
