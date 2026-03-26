@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.3.3
+ * Version:      1.3.8
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -24,7 +24,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
-define('NWWS_VERSION',    '1.3.3');
+define('NWWS_VERSION',    '1.3.8');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -202,6 +202,10 @@ class Neura_WooCommerce_Sync {
         // REST API
         add_action('rest_api_init', [$this, 'register_rest_routes']);
         add_action('rest_api_init', ['NWWS_Migrator_API', 'register_routes']);
+
+        // Background order/product sync (WP-Cron callback — MUST be registered or cron fires silently)
+        add_action('nwws_sync_order_bg',   [$this, 'sync_order'],   10, 1);
+        add_action('nwws_sync_product_bg', [$this, 'sync_product'], 10, 1);
 
         // AJAX
         add_action('wp_ajax_nwws_test_connection',    [$this, 'ajax_test_connection']);
@@ -526,7 +530,7 @@ JS;
         }
     }
 
-    private function sync_product(int $product_id): void {
+    public function sync_product(int $product_id): void {
         $product = wc_get_product($product_id);
         if (!$product) return;
 
@@ -721,7 +725,7 @@ JS;
         }
     }
 
-    private function sync_order(int $order_id): void {
+    public function sync_order(int $order_id): void {
         $order = wc_get_order($order_id);
         if (!$order) return;
 
@@ -745,10 +749,14 @@ JS;
                 'product_id'   => $item->get_product_id(),
                 'variation_id' => $item->get_variation_id(),
                 'name'         => $item->get_name(),
+                'sku'          => $product ? $product->get_sku() : null,
                 'quantity'     => $item->get_quantity(),
+                'price'        => $product ? (float) $product->get_price() : null,
                 'subtotal'     => $item->get_subtotal(),
                 'total'        => $item->get_total(),
                 'cogs'         => $cogs,
+                'unit_cogs'    => $product ? (float)($product->get_meta('_cogs_price') ?: $product->get_meta('_purchase_price') ?: $cogs) : $cogs,
+                'variant_name' => $product ? implode(' / ', array_filter(array_map(function($attr) { return $attr->get_option(); }, $product->get_attributes()))) : null,
             ];
         }
 
@@ -783,6 +791,29 @@ JS;
             'utm_content'     => $order->get_meta('_utm_content'),
             'utm_term'        => $order->get_meta('_utm_term'),
             'fbclid'          => $order->get_meta('_fbclid'),
+            'billing'          => [
+                'first_name' => $order->get_billing_first_name(),
+                'last_name'  => $order->get_billing_last_name(),
+                'email'      => $order->get_billing_email(),
+                'phone'      => $order->get_billing_phone(),
+                'address_1'  => $order->get_billing_address_1(),
+                'address_2'  => $order->get_billing_address_2(),
+                'city'       => $order->get_billing_city(),
+                'postcode'   => $order->get_billing_postcode(),
+                'country'    => $order->get_billing_country(),
+            ],
+            'shipping_address' => [
+                'first_name' => $order->get_shipping_first_name(),
+                'last_name'  => $order->get_shipping_last_name(),
+                'address_1'  => $order->get_shipping_address_1(),
+                'address_2'  => $order->get_shipping_address_2(),
+                'city'       => $order->get_shipping_city(),
+                'postcode'   => $order->get_shipping_postcode(),
+                'country'    => $order->get_shipping_country(),
+            ],
+            'coupon_codes'     => array_map(function($item) { return $item->get_code(); }, $order->get_coupon_codes()),
+            'tracking_number'  => $order->get_meta('_tracking_number') ?: $order->get_meta('_wc_shipment_tracking_items') ?: null,
+            'created_via'      => $order->get_created_via(),
         ];
 
         $this->send_to_api('orders', $data, 'POST');
@@ -1066,7 +1097,9 @@ JS;
 
     private function send_to_api(string $endpoint, array $data, string $method = 'POST'): bool {
         $api_url = get_option('nwws_api_url', '');
-        $api_key = get_option('nwws_api_key', '');
+        // nwws_push_key is the HMAC-derived key validated by the Next.js app.
+        // nwws_api_key is a legacy field; prefer push_key with fallback.
+        $api_key = get_option('nwws_push_key', '') ?: get_option('nwws_api_key', '');
 
         if (empty($api_url) || empty($api_key)) return false;
 

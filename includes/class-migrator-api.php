@@ -1428,9 +1428,10 @@ class NWWS_Migrator_API {
         }
 
         $user = wp_get_current_user();
-        $name = trim( $user->display_name ?? '' );
+        // Prefer first + last name (personal), fall back to display_name (often company), then login
+        $name = trim( ( $user->first_name ?? '' ) . ' ' . ( $user->last_name ?? '' ) );
         if ( ! $name ) {
-            $name = trim( ( $user->first_name ?? '' ) . ' ' . ( $user->last_name ?? '' ) );
+            $name = trim( $user->display_name ?? '' );
         }
 
         $response = new WP_REST_Response( [
