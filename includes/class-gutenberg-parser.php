@@ -149,6 +149,73 @@ class NWWS_Gutenberg_Parser {
                     }
                     break;
 
+                // ── RankMath FAQ block → gestructureerd faq sectie type ──────────
+                case 'rank-math/faq-block':
+                    $questions = [];
+                    foreach ( $attrs['questions'] ?? [] as $q ) {
+                        if ( ! ( $q['visible'] ?? true ) ) continue;
+                        $question = wp_strip_all_tags( $q['title'] ?? '' );
+                        $answer   = NWWS_Content_Cleaner::clean( $q['content'] ?? '' );
+                        if ( $question ) {
+                            $questions[] = [ 'question' => $question, 'answer' => $answer ];
+                        }
+                    }
+                    if ( ! empty( $questions ) ) {
+                        $sections[] = [
+                            'type'  => 'faq',
+                            'props' => [ 'questions' => $questions ],
+                        ];
+                    }
+                    break;
+
+                // ── RankMath TOC → overslaan (auto-gegenereerd uit headings) ──────
+                case 'rank-math/toc-block':
+                    break;
+
+                // ── Custom HTML block → bewaar raw HTML ───────────────────────────
+                case 'core/html':
+                    $clean = NWWS_Content_Cleaner::clean( $inner );
+                    if ( ! empty( trim( $clean ) ) ) {
+                        $sections[] = [
+                            'type'  => 'html',
+                            'props' => [ 'html' => $clean ],
+                        ];
+                    }
+                    break;
+
+                // ── Table block → bewaar als HTML tabel ───────────────────────────
+                case 'core/table':
+                    $clean = NWWS_Content_Cleaner::clean( $inner );
+                    if ( ! empty( trim( $clean ) ) ) {
+                        $sections[] = [
+                            'type'  => 'table',
+                            'props' => [ 'html' => $clean ],
+                        ];
+                    }
+                    break;
+
+                // ── Gallery → individuele afbeeldingen ────────────────────────────
+                case 'core/gallery':
+                    foreach ( $block['innerBlocks'] ?? [] as $img_block ) {
+                        $ia = $img_block['attrs'] ?? [];
+                        $src = $ia['url'] ?? wp_get_attachment_url( $ia['id'] ?? 0 ) ?: '';
+                        if ( $src ) {
+                            $sections[] = [
+                                'type'  => 'image',
+                                'props' => [
+                                    'src'     => $src,
+                                    'alt'     => $ia['alt'] ?? '',
+                                    'caption' => wp_strip_all_tags( $ia['caption'] ?? '' ),
+                                ],
+                            ];
+                        }
+                    }
+                    break;
+
+                // ── WPZOOM recipe embed in blog post → overslaan ─────────────────
+                case 'wpzoom-recipe-card/recipe-block-from-posts':
+                    break;
+
                 // WooCommerce blocks → overslaan
                 case 'woocommerce/product-title':
                 case 'woocommerce/product-image':
