@@ -116,7 +116,7 @@ class NWWS_Elementor_Parser {
                         'icon'  => $ws['selected_icon']['value'] ?? $ws['icon'] ?? null,
                         'image' => isset( $ws['image']['url'] ) ? $ws['image']['url'] : null,
                         'title' => wp_strip_all_tags( $ws['title'] ?? '' ),
-                        'text'  => NM_Content_Cleaner::clean( $ws['description'] ?? $ws['description_text'] ?? '' ),
+                        'text'  => NWWS_Content_Cleaner::clean( $ws['description'] ?? $ws['description_text'] ?? '' ),
                     ];
                     $i++;
                 }
@@ -130,7 +130,7 @@ class NWWS_Elementor_Parser {
                 while ( $i < count( $widgets ) && in_array( $widgets[$i]['widgetType'] ?? '', [ 'testimonial', 'testimonial-carousel' ] ) ) {
                     $ws = $widgets[$i]['settings'] ?? [];
                     $items[] = [
-                        'quote'  => NM_Content_Cleaner::clean( $ws['testimonial_content'] ?? '' ),
+                        'quote'  => NWWS_Content_Cleaner::clean( $ws['testimonial_content'] ?? '' ),
                         'name'   => wp_strip_all_tags( $ws['testimonial_name'] ?? '' ),
                         'title'  => wp_strip_all_tags( $ws['testimonial_job'] ?? '' ),
                         'avatar' => $ws['testimonial_image']['url'] ?? null,
@@ -147,7 +147,7 @@ class NWWS_Elementor_Parser {
                 foreach ( $s['tabs'] ?? [] as $tab ) {
                     $items[] = [
                         'question' => wp_strip_all_tags( $tab['tab_title'] ?? '' ),
-                        'answer'   => NM_Content_Cleaner::clean( $tab['tab_content'] ?? '' ),
+                        'answer'   => NWWS_Content_Cleaner::clean( $tab['tab_content'] ?? '' ),
                     ];
                 }
                 $sections[] = [ 'type' => 'faq', 'props' => [ 'items' => $items ] ];
@@ -172,7 +172,7 @@ class NWWS_Elementor_Parser {
                 case 'text-editor':
                     $sections[] = [
                         'type'  => 'html',
-                        'props' => [ 'html' => NM_Content_Cleaner::clean( $s['editor'] ?? '' ) ],
+                        'props' => [ 'html' => NWWS_Content_Cleaner::clean( $s['editor'] ?? '' ) ],
                     ];
                     break;
 
@@ -240,7 +240,7 @@ class NWWS_Elementor_Parser {
                 case 'html':
                     $sections[] = [
                         'type'  => 'html',
-                        'props' => [ 'html' => NM_Content_Cleaner::clean( $s['html'] ?? '' ) ],
+                        'props' => [ 'html' => NWWS_Content_Cleaner::clean( $s['html'] ?? '' ) ],
                     ];
                     break;
 
@@ -258,7 +258,7 @@ class NWWS_Elementor_Parser {
                     if ( ! empty( $fallback ) ) {
                         $sections[] = [
                             'type'  => 'html',
-                            'props' => [ 'html' => NM_Content_Cleaner::clean( $fallback ) ],
+                            'props' => [ 'html' => NWWS_Content_Cleaner::clean( $fallback ) ],
                         ];
                     }
                     break;
