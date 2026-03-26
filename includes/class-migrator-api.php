@@ -956,17 +956,23 @@ class NWWS_Migrator_API {
         $total = $query->found_posts;
 
         $data = array_map( function( $post ) {
-            // Recipe data stored in block content or post meta
-            $meta = get_post_meta( $post->ID );
+            $recipe = self::parse_wpzoom_recipe( $post->post_content );
+
             return [
                 'id'          => $post->ID,
                 'slug'        => $post->post_name,
-                'title'       => $post->post_title,
-                'content'     => NWWS_Content_Cleaner::clean( $post->post_content ),
-                'sections'    => has_blocks( $post->post_content )
-                    ? NWWS_Gutenberg_Parser::parse( $post->post_content )
-                    : [],
-                'featuredImg' => get_the_post_thumbnail_url( $post->ID, 'full' ) ?: null,
+                'title'       => $recipe['title']   ?? $post->post_title,
+                'summary'     => $recipe['summary']  ?? null,
+                'course'      => $recipe['course']   ?? [],
+                'cuisine'     => $recipe['cuisine']  ?? [],
+                'difficulty'  => $recipe['difficulty'] ?? null,
+                'keywords'    => $recipe['keywords'] ?? [],
+                'servings'    => $recipe['servings'] ?? null,
+                'prepTime'    => $recipe['prepTime'] ?? null,
+                'cookTime'    => $recipe['cookTime'] ?? null,
+                'ingredients' => $recipe['ingredients'] ?? [],
+                'steps'       => $recipe['steps']    ?? [],
+                'featuredImg' => $recipe['image']    ?? get_the_post_thumbnail_url( $post->ID, 'full' ) ?: null,
                 'categories'  => wp_get_post_terms( $post->ID, 'category', [ 'fields' => 'names' ] ),
                 'tags'        => wp_get_post_terms( $post->ID, 'post_tag', [ 'fields' => 'names' ] ),
                 'seo'         => self::get_seo_meta( $post->ID ),
@@ -1445,6 +1451,95 @@ class NWWS_Migrator_API {
         $response->header( 'Access-Control-Allow-Methods', 'GET' );
 
         return $response;
+    }
+
+    /**
+     * Parse a WPZOOM Recipe Card Blocks post_content and extract structured recipe data.
+     * The plugin stores all data in the Gutenberg block attributes as JSON.
+     * Returns an empty array if no WPZOOM recipe block is found.
+     */
+    private static function parse_wpzoom_recipe( string $post_content ): array {
+        if ( ! has_blocks( $post_content ) ) return [];
+
+        foreach ( parse_blocks( $post_content ) as $block ) {
+            if ( $block['blockName'] !== 'wpzoom-recipe-card/block-recipe-card' ) continue;
+
+            $a = $block['attrs'];
+
+            // ── Timing & servings from the "details" array ──────────────────
+            $servings = null;
+            $prep_time = null;
+            $cook_time = null;
+
+            foreach ( $a['details'] ?? [] as $d ) {
+                $label = strtolower( $d['jsonLabel'] ?? $d['label'] ?? '' );
+                $val   = $d['value'] ?? null;
+                if ( ! $val ) continue;
+
+                if ( str_contains( $label, 'person' ) || str_contains( $label, 'portie' ) ||
+                     str_contains( $label, 'serving' ) || str_contains( $label, 'personen' ) ) {
+                    $servings = (string) $val;
+                } elseif ( str_contains( $label, 'voorbereid' ) || str_contains( $label, 'prep' ) ||
+                           $label === 'voorbereiding' ) {
+                    $prep_time = (int) $val;
+                } elseif ( str_contains( $label, 'bbq' ) || str_contains( $label, 'cook' ) ||
+                           str_contains( $label, 'bereiding' ) || $label === 'tijd op bbq' ) {
+                    $cook_time = (int) $val;
+                }
+            }
+
+            // ── Ingredients ─────────────────────────────────────────────────
+            $ingredients = [];
+            foreach ( $a['ingredients'] ?? [] as $ing ) {
+                if ( $ing['isGroup'] ?? false ) {
+                    $ingredients[] = [ 'group' => $ing['jsonName'] ?? ( is_array( $ing['name'] ?? null ) ? implode( '', $ing['name'] ) : ( $ing['name'] ?? '' ) ) ];
+                    continue;
+                }
+                $p = $ing['parse'] ?? [];
+                $ingredients[] = [
+                    'amount'     => $p['amount'] ?? null,
+                    'unit'       => $p['unit']   ?? null,
+                    'ingredient' => $ing['jsonName'] ?? ( is_array( $ing['name'] ?? null ) ? implode( '', $ing['name'] ) : ( $ing['name'] ?? '' ) ),
+                ];
+            }
+
+            // ── Steps ────────────────────────────────────────────────────────
+            $steps = [];
+            foreach ( $a['steps'] ?? [] as $step ) {
+                if ( $step['isGroup'] ?? false ) {
+                    $steps[] = [ 'group' => $step['jsonGroupTitle'] ?? ( $step['groupTitle'] ?? '' ) ];
+                    continue;
+                }
+                // step text may be a string or an inline-rich-text array
+                $raw_text = $step['jsonText'] ?? null;
+                if ( $raw_text === null ) {
+                    $raw_text = is_array( $step['text'] ?? null )
+                        ? implode( '', $step['text'] )
+                        : ( $step['text'] ?? '' );
+                }
+                $steps[] = [
+                    'text'  => NWWS_Content_Cleaner::clean( $raw_text ),
+                    'image' => $step['image']['url'] ?? null,
+                ];
+            }
+
+            return [
+                'title'       => $a['recipeTitle'] ?? null,
+                'summary'     => $a['jsonSummary'] ?? $a['summary'] ?? null,
+                'course'      => $a['course']     ?? [],
+                'cuisine'     => $a['cuisine']    ?? [],
+                'difficulty'  => $a['difficulty'][0] ?? null,
+                'keywords'    => $a['keywords']   ?? [],
+                'servings'    => $servings,
+                'prepTime'    => $prep_time,
+                'cookTime'    => $cook_time,
+                'ingredients' => $ingredients,
+                'steps'       => $steps,
+                'image'       => $a['image']['url'] ?? null,
+            ];
+        }
+
+        return [];
     }
 
     /**
