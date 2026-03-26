@@ -3,7 +3,7 @@
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.3.8
+ * Version:      1.3.9
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -16,34 +16,39 @@
 
 defined('ABSPATH') || exit;
 
-// Check if WooCommerce is active
-if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
-    add_action('admin_notices', function () {
-        echo '<div class="error"><p><strong>Neura WooCommerce Sync</strong> vereist WooCommerce om te werken.</p></div>';
-    });
-    return;
-}
-
-define('NWWS_VERSION',    '1.3.8');
+define('NWWS_VERSION',    '1.3.9');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
 define('NWWS_GITHUB_OWNER', 'DaalderConcepts');
+define('NWWS_GITHUB_REPO',  'neura-wp-woo-sync');
+
+// Neuramerce Migrator — always loaded, works without WooCommerce
+require_once NWWS_PLUGIN_DIR . 'includes/class-migrator-auth.php';
+require_once NWWS_PLUGIN_DIR . 'includes/class-content-cleaner.php';
+require_once NWWS_PLUGIN_DIR . 'includes/class-elementor-parser.php';
+require_once NWWS_PLUGIN_DIR . 'includes/class-gutenberg-parser.php';
+require_once NWWS_PLUGIN_DIR . 'includes/class-migrator-api.php';
+
+// Check if WooCommerce is active (per-site or network-wide for multisite)
+$nwws_wc_active = in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))
+    || array_key_exists('woocommerce/woocommerce.php', (array) get_site_option('active_sitewide_plugins', []));
+
+if ( ! $nwws_wc_active ) {
+    // Register Migrator API routes even without WooCommerce
+    add_action('rest_api_init', ['NWWS_Migrator_API', 'register_routes']);
+    add_action('admin_notices', function () {
+        echo '<div class="notice notice-warning"><p><strong>Neura WooCommerce Sync</strong>: WooCommerce niet gevonden — WooCommerce sync is uitgeschakeld. De Migrator API is wel beschikbaar.</p></div>';
+    });
+    return;
+}
+
 // Declare HPOS (Custom Order Tables) compatibility
 add_action('before_woocommerce_init', function () {
     if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
         \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', NWWS_PLUGIN_FILE, true);
     }
 });
-
-define('NWWS_GITHUB_REPO',  'neura-wp-woo-sync');
-
-// Neuramerce Migrator
-require_once NWWS_PLUGIN_DIR . 'includes/class-migrator-auth.php';
-require_once NWWS_PLUGIN_DIR . 'includes/class-content-cleaner.php';
-require_once NWWS_PLUGIN_DIR . 'includes/class-elementor-parser.php';
-require_once NWWS_PLUGIN_DIR . 'includes/class-gutenberg-parser.php';
-require_once NWWS_PLUGIN_DIR . 'includes/class-migrator-api.php';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GitHub Auto-Updater
