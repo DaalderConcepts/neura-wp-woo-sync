@@ -1,6 +1,9 @@
 <?php
 /**
  * Admin Settings Page Template
+ *
+ * @deprecated v1.4.0 — vervangen door templates/tab-connect.php + templates/tab-woocommerce.php
+ * Dit bestand wordt niet meer geladen. Veilig te verwijderen na verificatie van v1.4.0.
  */
 defined('ABSPATH') || exit;
 
@@ -25,8 +28,9 @@ $sync_fields_size       = get_option('nwws_sync_fields_size',       '1') === '1'
 $sync_fields_categories = get_option('nwws_sync_fields_categories', '1') === '1';
 
 // Enabled attribute taxonomies (comma-separated slugs)
-$chat_enabled   = get_option('nwws_chat_enabled',   '0') === '1';
-$chat_inbox_key = get_option('nwws_chat_inbox_key', '');
+$chat_enabled    = get_option('nwws_chat_enabled',   '0') === '1';
+$chat_inbox_key  = get_option('nwws_chat_inbox_key', '');
+$tracking_token  = get_option('nwws_tracking_token', '');
 
 $sync_attrs_raw  = get_option('nwws_sync_attrs', 'product_brand');
 $sync_attrs_list = array_filter(array_map('trim', explode(',', $sync_attrs_raw)));
@@ -224,6 +228,23 @@ asort($attr_taxonomies);
                                 <em>Inbox → Instellingen → Widget → Embed code</em>.
                                 <?php if (!empty($chat_inbox_key)): ?>
                                     <br><span style="color:#46b450;">✓ Geconfigureerd</span>
+                                <?php endif; ?>
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="nwws_tracking_token">Tracking Token</label></th>
+                        <td>
+                            <input type="text" id="nwws_tracking_token" name="nwws_tracking_token"
+                                   value="<?php echo esc_attr($tracking_token); ?>"
+                                   class="regular-text" placeholder="cxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                            <p class="description">
+                                Kopieer de <strong>Client Token</strong> uit Neuramerce via
+                                <em>Adverteren → Tracking → Tokens → Nieuw token</em>.
+                                Hiermee wordt <code>track.js</code> automatisch geladen op de webshop
+                                en worden aankopen doorgestuurd voor multi-touch attributie.
+                                <?php if (!empty($tracking_token)): ?>
+                                    <br><span style="color:#46b450;">✓ Geconfigureerd — track.js actief op alle pagina's</span>
                                 <?php endif; ?>
                             </p>
                         </td>

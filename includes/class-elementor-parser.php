@@ -1,10 +1,12 @@
 <?php
+declare(strict_types=1);
 /**
  * Parseert _elementor_data JSON naar Neuramerce PageSection-structuur.
  *
  * Elke widget wordt gemapped naar een of meer secties.
  * Widgets die niet direct gemapped worden, komen terecht als 'html' blok.
  */
+defined('ABSPATH') || exit;
 class NWWS_Elementor_Parser {
 
     /**

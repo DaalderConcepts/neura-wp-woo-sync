@@ -1,10 +1,14 @@
 <?php
+declare(strict_types=1);
 /**
  * REST API endpoints voor Neuramerce Migrator.
  * Base: /wp-json/neuramerce/v1/
  *
  * Authenticatie: X-Neuramerce-Key header
  */
+
+defined('ABSPATH') || exit;
+
 class NWWS_Migrator_API {
 
     const NAMESPACE = 'neuramerce/v1';
@@ -17,8 +21,10 @@ class NWWS_Migrator_API {
         $routes = [
             'status'              => 'get_status',
             'site'                => 'get_site',
+            'sites'               => 'get_sites',         // v1.6: multisite blogs lijst
             'pages'               => 'get_pages',
             'posts'               => 'get_posts',
+            'terms'               => 'get_terms',         // v1.6: generic taxonomy-terms fetcher
             'media'               => 'get_media',
             'products'            => 'get_products',
             'categories'          => 'get_categories',
@@ -39,20 +45,41 @@ class NWWS_Migrator_API {
             'stock'               => 'get_stock',
         ];
 
+        $paginate_args = [
+            'page'     => [ 'sanitize_callback' => 'absint', 'default' => 1 ],
+            'per_page' => [ 'sanitize_callback' => 'absint', 'default' => 10 ],
+            'lang'     => [ 'sanitize_callback' => 'sanitize_key' ],
+            // v1.6: multisite blog selector. Als site_id leeg/0 → huidige blog.
+            'site_id'  => [ 'sanitize_callback' => 'absint' ],
+            // v1.6: 'html' = rendered + Elementor stripped naar schone HTML.
+            //       'sections' (default) = bestaande structured output.
+            'format'   => [ 'sanitize_callback' => 'sanitize_key' ],
+            // v1.6: taxonomy-filters (alleen gebruikt door /terms)
+            'taxonomy'  => [ 'sanitize_callback' => 'sanitize_key' ],
+            'post_type' => [ 'sanitize_callback' => 'sanitize_key' ],
+        ];
+
         foreach ( $routes as $route => $method ) {
             register_rest_route( self::NAMESPACE, '/' . $route, [
                 'methods'             => 'GET',
-                'callback'            => [ __CLASS__, $method ],
+                'callback'            => function ( WP_REST_Request $req ) use ( $method ) {
+                    return self::with_site_switch( $req, [ __CLASS__, $method ] );
+                },
                 'permission_callback' => $auth,
+                'args'                => $paginate_args,
             ] );
         }
 
-        // order-status is publiek — beveiliging zit in ordernummer + e-mail combinatie.
-        // Geen Neuramerce API key nodig zodat het altijd werkt vanuit de chat-widget.
+        // order-status is intentionally public — security via order number + email combination.
+        // No Neuramerce API key needed so it always works from the chat widget.
         register_rest_route( self::NAMESPACE, '/order-status', [
             'methods'             => 'GET',
             'callback'            => [ __CLASS__, 'get_order_status' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => fn() => true, // intentionally public — see comment above
+            'args'                => [
+                'order_id' => [ 'required' => true, 'sanitize_callback' => 'absint' ],
+                'email'    => [ 'required' => true, 'sanitize_callback' => 'sanitize_email' ],
+            ],
         ] );
 
         // Auth verify (POST)
@@ -62,13 +89,257 @@ class NWWS_Migrator_API {
             'permission_callback' => $auth,
         ] );
 
-        // Current customer — publiek (gebruikt WP sessie-cookie van bezoeker)
-        // Geeft ingelogde WP/WooCommerce gebruiker terug zodat widget naam+email weet
+        // current-customer is intentionally public — uses the visitor's WP session cookie.
+        // Returns logged-in WP/WooCommerce user so the chat widget knows name + email.
         register_rest_route( self::NAMESPACE, '/current-customer', [
             'methods'             => 'GET',
             'callback'            => [ __CLASS__, 'get_current_customer' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => fn() => true, // intentionally public — see comment above
         ] );
+
+        // media-binary streamt een afbeelding uit /wp-content/uploads/ direct via PHP.
+        // Bypasst Cloudflare/Wordfence hotlink-protection die externe origins blokkeert.
+        // Auth via dezelfde API key als andere endpoints.
+        register_rest_route( self::NAMESPACE, '/media-binary', [
+            'methods'             => 'GET',
+            'callback'            => [ __CLASS__, 'get_media_binary' ],
+            'permission_callback' => $auth,
+            'args'                => [
+                'url' => [
+                    'required'          => true,
+                    'validate_callback' => fn( $v ) => is_string( $v ) && filter_var( $v, FILTER_VALIDATE_URL ),
+                ],
+            ],
+        ] );
+
+        // media-binary/test is een dev/diagnose endpoint — geeft uploads dir + sample bestanden terug
+        // zodat je kunt verifiëren of de streamer werkt zonder een echte URL te kennen.
+        register_rest_route( self::NAMESPACE, '/media-binary/test', [
+            'methods'             => 'GET',
+            'callback'            => [ __CLASS__, 'get_media_binary_test' ],
+            'permission_callback' => $auth,
+        ] );
+
+        // products/count (v1.7) — snelle voortgangsbalk-bron voor POS-import preview.
+        // Gebruikt wp_count_posts (1 SQL count) i.p.v. wc_get_products(limit=-1) dat ALLE
+        // product-IDs uit de DB pulls — laatst gemeten op nomadfire 5+ seconden voor 2k+ shops.
+        // Gewikkeld in with_site_switch zodat multisite ?site_id= werkt.
+        register_rest_route( self::NAMESPACE, '/products/count', [
+            'methods'             => 'GET',
+            'callback'            => function ( WP_REST_Request $req ) {
+                return self::with_site_switch( $req, [ __CLASS__, 'get_products_count' ] );
+            },
+            'permission_callback' => $auth,
+            'args'                => [
+                'site_id' => [ 'sanitize_callback' => 'absint' ],
+            ],
+        ] );
+
+        // ─── Push-endpoints vanuit Neuramerce ────────────────────────────────
+        // Vervangen "Woo Custom Stock Status Pro" + dynamische orderstatussen.
+        // Auth via dezelfde Bearer/X-Neuramerce-Key flow als andere protected routes.
+
+        // /order-statuses — POST = bulk-overschrijven van WP-option;
+        // GET (v1.11.0) = live-fetch van actieve wc-<key> post_statuses
+        // voor Neura's safeguard_status_mapping_consistency drift-detectie.
+        //
+        // Review-fix: één register_rest_route call met dual methods ipv twee
+        // aparte calls. Voorkomt edge-case op multisite waar tweede registratie
+        // de eerste kan overriden bij dubbele plugin-init.
+        register_rest_route( self::NAMESPACE, '/order-statuses', [
+            'methods'             => WP_REST_Server::READABLE | WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'order_statuses_dispatch' ],
+            'permission_callback' => $auth,
+        ] );
+
+        // POST /stock-texts — bulk voorraadtekst-update voor producten + categorieën.
+        // Body: { products: [{ wp_id, text }], categories: [{ wp_id, text }] }
+        register_rest_route( self::NAMESPACE, '/stock-texts', [
+            'methods'             => 'POST',
+            'callback'            => [ __CLASS__, 'sync_stock_texts' ],
+            'permission_callback' => $auth,
+        ] );
+
+        // POST /orders/{id}/status — zet custom status op één WC-order + leverdatum.
+        // Body: { status_key, planned_delivery_at? }
+        register_rest_route( self::NAMESPACE, '/orders/(?P<id>\d+)/status', [
+            'methods'             => 'POST',
+            'callback'            => [ __CLASS__, 'set_order_status' ],
+            'permission_callback' => $auth,
+            'args'                => [
+                'id' => [ 'required' => true, 'sanitize_callback' => 'absint' ],
+            ],
+        ] );
+
+        // POST /shipping-schedules — volledige snapshot van shipping-config.
+        // Body: { default: {...}, overrides: [{category_slug, week_config, message_tpl}], exceptions: [{date, type, label}] }
+        register_rest_route( self::NAMESPACE, '/shipping-schedules', [
+            'methods'             => 'POST',
+            'callback'            => [ __CLASS__, 'sync_shipping_schedules' ],
+            'permission_callback' => $auth,
+        ] );
+    }
+
+    // ─── Plugin meta-block (v1.7 feature-detectie) ───────────────────────────
+    //
+    // Frontend leest meta.features uit /products + /categories responses om te
+    // beslissen welke code-paths te gebruiken (light_mode, paginated_categories, count_endpoint).
+    // Backwards-compat: oude clients die meta-block negeren werken gewoon door.
+
+    private static function meta_block(): array {
+        return [
+            'plugin_version' => defined( 'NWWS_VERSION' ) ? NWWS_VERSION : 'unknown',
+            'features'       => [
+                'light_mode',           // /products?light=1 → format_product_light (~10× sneller)
+                'paginated_categories', // /categories?page=N&per_page=M (backwards-compat: zonder = alles)
+                'count_endpoint',       // /products/count
+                'format_hardened',      // try/catch rond format_product et al — 1 kapot product crasht niet
+                'multisite',            // v1.6: ?site_id= switch_to_blog support
+                'media_binary',         // v1.6: image streaming voor CF-bypass
+                'taxonomy_terms',       // v1.6: generic /terms fetcher
+            ],
+        ];
+    }
+
+    // ─── Multisite helpers (v1.6) ─────────────────────────────────────────────
+
+    /**
+     * Wrapper die bij elke endpoint eerst switch_to_blog($site_id) doet zodra de
+     * caller een `site_id` query-param heeft meegegeven. Werkt alleen op WP-multisite
+     * installs; op single-site wordt site_id stil genegeerd. Altijd met try/finally
+     * zodat restore_current_blog() ook bij exceptions draait — anders blijft de
+     * hoofd-blog permanent op de verkeerde state staan.
+     */
+    private static function with_site_switch( WP_REST_Request $req, callable $handler ) {
+        $site_id = (int) $req->get_param( 'site_id' );
+        $switched = false;
+
+        if ( $site_id > 0 && is_multisite() ) {
+            // Verifieer dat deze blog-ID bestaat binnen het netwerk — anders 404.
+            $blog = get_site( $site_id );
+            if ( ! $blog ) {
+                return new WP_Error( 'unknown_site', "Blog {$site_id} niet gevonden in netwerk", [ 'status' => 404 ] );
+            }
+            switch_to_blog( $site_id );
+            $switched = true;
+        }
+
+        try {
+            return call_user_func( $handler, $req );
+        } finally {
+            if ( $switched ) restore_current_blog();
+        }
+    }
+
+    /**
+     * Lijst alle blogs in een WP multisite-installatie. Op single-site retourneert
+     * dit één rij: de huidige site. Handig voor de Neuramerce import-UI om een
+     * dropdown te vullen.
+     */
+    public static function get_sites(): WP_REST_Response {
+        if ( ! is_multisite() ) {
+            return new WP_REST_Response( [ 'items' => [ [
+                'id'       => 1,
+                'name'     => get_bloginfo( 'name' ),
+                'url'      => get_site_url(),
+                'path'     => '/',
+                'public'   => true,
+                'archived' => false,
+            ] ] ] );
+        }
+
+        $blogs = get_sites( [ 'number' => 200, 'spam' => 0, 'deleted' => 0 ] );
+        $items = array_map( function ( $b ) {
+            switch_to_blog( (int) $b->blog_id );
+            $data = [
+                'id'       => (int) $b->blog_id,
+                'name'     => get_bloginfo( 'name' ),
+                'url'      => get_site_url(),
+                'path'     => $b->path,
+                'public'   => (int) $b->public === 1,
+                'archived' => (int) $b->archived === 1,
+            ];
+            restore_current_blog();
+            return $data;
+        }, $blogs );
+
+        return new WP_REST_Response( [ 'items' => $items, 'total' => count( $items ) ] );
+    }
+
+    /**
+     * Generieke taxonomy-terms fetcher. Eén endpoint voor alle type taxonomieën:
+     *   - ?taxonomy=category       → blog-categorieën
+     *   - ?taxonomy=post_tag       → blog-tags
+     *   - ?taxonomy=product_cat    → WooCommerce product-categorieën
+     *   - ?taxonomy=page_category  → als custom taxonomy op pages bestaat
+     *   - ?taxonomy=recipe_category, recipe_tag, etc.
+     *
+     * Optionele post_type filter beperkt tot taxonomieën die op dat post-type actief zijn.
+     * Als taxonomy niet bestaat → lege array (niet 404 — makkelijker voor UI die
+     * meerdere taxonomieën in parallel ophaalt).
+     */
+    public static function get_terms( WP_REST_Request $req ): WP_REST_Response {
+        $taxonomy = (string) $req->get_param( 'taxonomy' );
+        if ( empty( $taxonomy ) || ! taxonomy_exists( $taxonomy ) ) {
+            return new WP_REST_Response( [ 'items' => [], 'total' => 0, 'taxonomy' => $taxonomy ?: null ] );
+        }
+
+        $terms = get_terms( [
+            'taxonomy'   => $taxonomy,
+            'hide_empty' => false,
+            'number'     => 500,
+        ] );
+
+        if ( is_wp_error( $terms ) ) {
+            return new WP_REST_Response( [ 'items' => [], 'error' => $terms->get_error_message() ], 200 );
+        }
+
+        $data = array_map( function ( $t ) {
+            $thumb_id  = (int) get_term_meta( $t->term_id, 'thumbnail_id', true );
+            $image_url = $thumb_id ? wp_get_attachment_image_url( $thumb_id, 'full' ) : null;
+            return [
+                'id'          => (int) $t->term_id,
+                'name'        => $t->name,
+                'slug'        => $t->slug,
+                'description' => wp_strip_all_tags( (string) $t->description ),
+                'parentId'    => $t->parent ? (int) $t->parent : null,
+                'count'       => (int) $t->count,
+                'image'       => $image_url,
+                'taxonomy'    => $t->taxonomy,
+            ];
+        }, $terms );
+
+        return new WP_REST_Response( [
+            'items'    => $data,
+            'total'    => count( $data ),
+            'taxonomy' => $taxonomy,
+        ] );
+    }
+
+    /**
+     * Render een post (pagina of blogpost) naar schone HTML, ongeacht of hij met
+     * Elementor, Gutenberg of de Classic editor is gebouwd. Output = semantische
+     * HTML, Elementor-wrapper-divs gestript, style/class attributes weg.
+     *
+     * Voor Elementor: gebruik frontend-renderer zodat widgets server-side
+     * geëxpandeerd worden (anders krijg je alleen shortcodes + data-attributes).
+     */
+    private static function render_clean_html( WP_Post $post ): string {
+        $is_elementor = ! empty( get_post_meta( $post->ID, '_elementor_data', true ) );
+
+        if ( $is_elementor && class_exists( '\\Elementor\\Plugin' ) ) {
+            try {
+                $rendered = \Elementor\Plugin::$instance->frontend->get_builder_content_for_display( $post->ID, true );
+            } catch ( \Throwable $e ) {
+                $rendered = apply_filters( 'the_content', $post->post_content );
+            }
+        } else {
+            // Gutenberg-blocks, classic content en shortcodes — allemaal via the_content filter
+            // waardoor blocks gerenderd worden en shortcodes verwerkt.
+            $rendered = apply_filters( 'the_content', $post->post_content );
+        }
+
+        return NWWS_Content_Cleaner::clean( (string) $rendered );
     }
 
     // ─── Status ───────────────────────────────────────────────────────────────
@@ -76,7 +347,15 @@ class NWWS_Migrator_API {
     public static function get_status(): WP_REST_Response {
         $wc_active   = class_exists( 'WooCommerce' );
         $wpml_active = defined( 'ICL_SITEPRESS_VERSION' );
-        $wpml_langs  = $wpml_active
+
+        // WPML's wpml_active_languages filter can trigger loopback REST requests on some
+        // server configurations (WPML makes internal HTTP calls to refresh language data).
+        // We suppress all WPML/WCML translation filters before calling it to prevent
+        // recursive REST dispatches that cause PHP-FPM deadlocks.
+        if ( $wpml_active ) {
+            remove_all_filters( 'wpml_active_languages' );
+        }
+        $wpml_langs = $wpml_active
             ? array_keys( (array) apply_filters( 'wpml_active_languages', null ) )
             : [];
 
@@ -176,8 +455,9 @@ class NWWS_Migrator_API {
             'ignore_sticky_posts' => true,
         ] );
 
-        $total = $query->found_posts;
-        $data  = array_map( fn( $p ) => self::format_page( $p ), $query->posts );
+        $format = (string) $req->get_param( 'format' );
+        $total  = $query->found_posts;
+        $data   = array_map( fn( $p ) => self::format_page( $p, $format === 'html' ), $query->posts );
 
         self::wpml_restore_language( $prev_lang );
 
@@ -190,46 +470,47 @@ class NWWS_Migrator_API {
         ] );
     }
 
-    private static function format_page( WP_Post $post ): array {
+    private static function format_page( WP_Post $post, bool $html_only = false ): array {
         $is_elementor = ! empty( get_post_meta( $post->ID, '_elementor_data', true ) );
         $is_gutenberg = ! $is_elementor && has_blocks( $post->post_content );
+        $builder      = $is_elementor ? 'elementor' : ( $is_gutenberg ? 'gutenberg' : 'classic' );
 
-        // Parse naar secties
-        if ( $is_elementor ) {
-            $parsed   = NWWS_Elementor_Parser::parse( $post->ID );
-            $sections = $parsed['sections'];
-            $builder  = 'elementor';
-        } elseif ( $is_gutenberg ) {
-            $sections = NWWS_Gutenberg_Parser::parse( $post->post_content );
-            $builder  = 'gutenberg';
-        } else {
-            // Classic editor of plain HTML
-            $sections = [ [
-                'type'  => 'html',
-                'props' => [ 'html' => NWWS_Content_Cleaner::clean( $post->post_content ) ],
-            ] ];
-            $builder = 'classic';
-        }
-
-        $lang = defined( 'ICL_SITEPRESS_VERSION' )
-            ? apply_filters( 'wpml_element_language_code', null, [ 'element_id' => $post->ID, 'element_type' => 'post_page' ] )
-            : null;
-
-        return [
+        $payload = [
             'id'          => $post->ID,
             'slug'        => $post->post_name,
             'title'       => $post->post_title,
             'status'      => $post->post_status,
             'parentId'    => $post->post_parent ?: null,
             'menuOrder'   => $post->menu_order,
-            'lang'        => $lang ?? 'nl',
+            'lang'        => defined( 'ICL_SITEPRESS_VERSION' )
+                ? ( apply_filters( 'wpml_element_language_code', null, [ 'element_id' => $post->ID, 'element_type' => 'post_page' ] ) ?? 'nl' )
+                : 'nl',
             'builder'     => $builder,
-            'sections'    => $sections,
             'seo'         => self::get_seo_meta( $post->ID ),
             'featuredImg' => get_the_post_thumbnail_url( $post->ID, 'full' ) ?: null,
             'createdAt'   => $post->post_date,
             'updatedAt'   => $post->post_modified,
         ];
+
+        if ( $html_only ) {
+            // v1.6: clean HTML output — Elementor/Gutenberg/Classic naar één semantische string.
+            $payload['html'] = self::render_clean_html( $post );
+        } else {
+            // Legacy: structured sections (backwards compat voor bestaande consumers).
+            if ( $is_elementor ) {
+                $parsed          = NWWS_Elementor_Parser::parse( $post->ID );
+                $payload['sections'] = $parsed['sections'];
+            } elseif ( $is_gutenberg ) {
+                $payload['sections'] = NWWS_Gutenberg_Parser::parse( $post->post_content );
+            } else {
+                $payload['sections'] = [ [
+                    'type'  => 'html',
+                    'props' => [ 'html' => NWWS_Content_Cleaner::clean( $post->post_content ) ],
+                ] ];
+            }
+        }
+
+        return $payload;
     }
 
     // ─── Blog posts ───────────────────────────────────────────────────────────
@@ -252,23 +533,17 @@ class NWWS_Migrator_API {
             'ignore_sticky_posts' => true,
         ] );
 
-        $total = $query->found_posts;
-        $posts = $query->posts;
+        $total     = $query->found_posts;
+        $posts     = $query->posts;
+        $html_only = $req->get_param( 'format' ) === 'html';
 
         self::wpml_restore_language( $prev_lang );
 
-        $data = array_map( function( $p ) {
+        $data = array_map( function( $p ) use ( $html_only ) {
             $is_elementor = ! empty( get_post_meta( $p->ID, '_elementor_data', true ) );
-            if ( $is_elementor ) {
-                $parsed  = NWWS_Elementor_Parser::parse( $p->ID );
-                $content = $parsed['sections'];
-                $builder = 'elementor';
-            } else {
-                $content = NWWS_Gutenberg_Parser::parse( $p->post_content );
-                $builder = has_blocks( $p->post_content ) ? 'gutenberg' : 'classic';
-            }
+            $builder      = $is_elementor ? 'elementor' : ( has_blocks( $p->post_content ) ? 'gutenberg' : 'classic' );
 
-            // Excerpt: gebruik ingesteld excerpt of eerste 200 tekens van clean content
+            // Excerpt: gebruik ingesteld excerpt of eerste 30 woorden van clean content
             $excerpt = $p->post_excerpt ?: wp_trim_words(
                 wp_strip_all_tags( $p->post_content ), 30, '…'
             );
@@ -277,21 +552,38 @@ class NWWS_Migrator_API {
                 ? apply_filters( 'wpml_element_language_code', null, [ 'element_id' => $p->ID, 'element_type' => 'post_post' ] )
                 : null;
 
-            return [
+            // Category + tag objects met term_ids zodat Neuramerce M:N assignments kan maken.
+            $cat_terms = wp_get_post_terms( $p->ID, 'category', [ 'fields' => 'all' ] );
+            $tag_terms = wp_get_post_terms( $p->ID, 'post_tag', [ 'fields' => 'all' ] );
+
+            $payload = [
                 'id'          => $p->ID,
                 'slug'        => $p->post_name,
                 'title'       => $p->post_title,
                 'excerpt'     => $excerpt,
                 'lang'        => $lang ?? 'nl',
                 'builder'     => $builder,
-                'sections'    => $content,
                 'seo'         => self::get_seo_meta( $p->ID ),
                 'featuredImg' => get_the_post_thumbnail_url( $p->ID, 'full' ) ?: null,
-                'categories'  => wp_get_post_terms( $p->ID, 'category', [ 'fields' => 'names' ] ),
-                'tags'        => wp_get_post_terms( $p->ID, 'post_tag', [ 'fields' => 'names' ] ),
+                'categories'  => array_map( fn( $t ) => [ 'id' => (int) $t->term_id, 'name' => $t->name, 'slug' => $t->slug ], is_wp_error( $cat_terms ) ? [] : $cat_terms ),
+                'tags'        => array_map( fn( $t ) => [ 'id' => (int) $t->term_id, 'name' => $t->name, 'slug' => $t->slug ], is_wp_error( $tag_terms ) ? [] : $tag_terms ),
                 'publishedAt' => $p->post_date,
                 'updatedAt'   => $p->post_modified,
             ];
+
+            if ( $html_only ) {
+                $payload['html'] = self::render_clean_html( $p );
+            } else {
+                // Legacy: sections-formaat (backwards compat).
+                if ( $is_elementor ) {
+                    $parsed             = NWWS_Elementor_Parser::parse( $p->ID );
+                    $payload['sections'] = $parsed['sections'];
+                } else {
+                    $payload['sections'] = NWWS_Gutenberg_Parser::parse( $p->post_content );
+                }
+            }
+
+            return $payload;
         }, $posts );
 
         return new WP_REST_Response( [
@@ -354,6 +646,10 @@ class NWWS_Migrator_API {
 
         $page  = max( 1, (int) $req->get_param( 'page' ) ?: 1 );
         $per   = min( 50, max( 1, (int) $req->get_param( 'per_page' ) ?: 20 ) );
+        // v1.7: ?light=1 → format_product_light, ~10× sneller (skip gallery, variations,
+        // attributes, addons, SEO, related). Voor POS-import preview. Volledige
+        // format_product blijft default voor migratie/full-sync.
+        $light = (bool) (int) ( $req->get_param( 'light' ) ?? 0 );
 
         $prev_lang = self::wpml_switch_to_nl();
 
@@ -367,94 +663,197 @@ class NWWS_Migrator_API {
             'suppress_filters' => false,
         ] );
         $products = $query->get_products();
-        $total    = (int) wc_get_products( [ 'return' => 'ids', 'limit' => -1, 'status' => 'publish', 'count_only' => true ] );
+        // v1.7: wp_count_posts is een 1-query indexed lookup, vele malen sneller dan
+        // wc_get_products( limit=-1 ) dat alle product-IDs in PHP-memory laadt.
+        $total    = (int) wp_count_posts( 'product' )->publish;
 
         self::wpml_restore_language( $prev_lang );
 
-        $data = array_map( [ __CLASS__, 'format_product' ], $products );
+        $formatter = $light
+            ? [ __CLASS__, 'format_product_light' ]
+            : [ __CLASS__, 'format_product' ];
+        $data = array_map( $formatter, $products );
 
         return new WP_REST_Response( [
             'total'    => $total,
             'page'     => $page,
             'per_page' => $per,
-            'pages'    => (int) ceil( $total / $per ),
+            'pages'    => $per > 0 ? (int) ceil( $total / $per ) : 1,
             'items'    => $data,
+            'meta'     => self::meta_block(),
         ] );
     }
 
-    private static function format_product( WC_Product $p ): array {
-        $images = array_map( fn( $id ) => [
-            'url' => wp_get_attachment_image_url( $id, 'full' ),
-            'alt' => get_post_meta( $id, '_wp_attachment_image_alt', true ),
-        ], array_filter( array_merge( [ $p->get_image_id() ], $p->get_gallery_image_ids() ) ) );
-
-        $variations = [];
-        if ( $p->is_type( 'variable' ) ) {
-            foreach ( $p->get_children() as $var_id ) {
-                $v = wc_get_product( $var_id );
-                if ( ! $v ) continue;
-                $variations[] = [
-                    'id'         => $var_id,
-                    'sku'        => $v->get_sku(),
-                    'price'      => (float) $v->get_price(),
-                    'salePrice'  => $v->is_on_sale() ? (float) $v->get_sale_price() : null,
-                    'stock'      => $v->get_stock_quantity(),
-                    'attributes' => $v->get_variation_attributes(),
-                ];
-            }
+    /**
+     * v1.7: Snelle count-endpoint voor frontend-voortgangsbalk.
+     * Pre-1.7 gebruikte de frontend wc_get_products(limit=-1) wat traag is bij grote shops.
+     * Wikkeling met with_site_switch bij multisite gebeurt in register_routes().
+     */
+    public static function get_products_count(): WP_REST_Response {
+        if ( ! class_exists( 'WooCommerce' ) ) {
+            return new WP_REST_Response( [ 'error' => 'WooCommerce niet actief' ], 400 );
         }
-
-        // Haal merk/kleur/maat op uit product attributes
-        $attrs = [];
-        foreach ( $p->get_attributes() as $attr ) {
-            $name = wc_attribute_label( $attr->get_name() );
-            $vals = $attr->is_taxonomy()
-                ? wc_get_product_terms( $p->get_id(), $attr->get_name(), [ 'fields' => 'names' ] )
-                : $attr->get_options();
-            $attrs[ strtolower( $name ) ] = implode( ', ', $vals );
-        }
-
-        $pid = $p->get_id();
-
-        return [
-            'id'             => $pid,
-            'sku'            => $p->get_sku(),
-            'name'           => $p->get_name(),
-            'slug'           => $p->get_slug(),
-            'description'    => NWWS_Content_Cleaner::clean( $p->get_description() ),
-            'shortDesc'      => NWWS_Content_Cleaner::clean( $p->get_short_description() ),
-            'price'          => (float) $p->get_price(),
-            'regularPrice'   => (float) $p->get_regular_price(),
-            'salePrice'      => $p->is_on_sale() ? (float) $p->get_sale_price() : null,
-            'stock'          => $p->get_stock_quantity(),
-            'stockStatus'    => $p->get_stock_status(),
-            'manageStock'    => $p->get_manage_stock(),
-            'backorders'     => $p->get_backorders() !== 'no',
-            'weight'         => $p->get_weight(),
-            'dimensions'     => [
-                'length' => $p->get_length(),
-                'width'  => $p->get_width(),
-                'height' => $p->get_height(),
+        $total = (int) wp_count_posts( 'product' )->publish;
+        return new WP_REST_Response( [
+            'total'    => $total,
+            'pages_at' => [
+                '5'  => (int) ceil( $total / 5 ),
+                '10' => (int) ceil( $total / 10 ),
+                '15' => (int) ceil( $total / 15 ),
+                '25' => (int) ceil( $total / 25 ),
+                '50' => (int) ceil( $total / 50 ),
             ],
-            'shippingClass'  => $p->get_shipping_class() ?: null,
-            'type'           => $p->get_type(), // simple | variable | grouped | external
-            'categories'     => wp_get_post_terms( $pid, 'product_cat', [ 'fields' => 'names' ] ),
-            'tags'           => wp_get_post_terms( $pid, 'product_tag', [ 'fields' => 'names' ] ),
-            'images'         => $images,
-            'attributes'     => $attrs,
-            'brand'          => $attrs['merk'] ?? $attrs['brand'] ?? null,
-            'ean'            => get_post_meta( $pid, '_ean', true )
-                             ?: get_post_meta( $pid, '_gtin', true )
-                             ?: get_post_meta( $pid, '_cr_gtin', true )
-                             ?: null,
-            'variations'     => $variations,
-            'crossSells'     => self::format_related_products( $p->get_cross_sell_ids() ),
-            'upsells'        => self::format_related_products( $p->get_upsell_ids() ),
-            'addons'         => self::get_product_addons( $pid ),
-            'seo'            => self::get_seo_meta( $pid ),
-            'permalink'      => get_permalink( $pid ),
-            'createdAt'      => $p->get_date_created() ? $p->get_date_created()->date( 'c' ) : null,
-        ];
+            'meta'     => self::meta_block(),
+        ] );
+    }
+
+    /**
+     * v1.7: Lichtgewicht product-formatter voor POS-import preview.
+     *
+     * Verschil met format_product():
+     *   - alleen featured image in 'medium' size (geen full-res gallery)
+     *   - geen variations (skip wc_get_product per variation)
+     *   - geen attribute-taxonomy queries
+     *   - geen TM Extra Options / WooSB / SEO meta / related products
+     *   - shortDesc truncated 500 chars
+     *
+     * Resultaat: ~10× sneller. Voor preview heeft frontend toch alleen
+     * id/sku/name/price/image nodig om matching + selectie te tonen.
+     * Volledige product-data wordt later via execute-flow opgehaald (zonder ?light=1).
+     */
+    private static function format_product_light( WC_Product $p ): array {
+        try {
+            $pid = $p->get_id();
+            $img = wp_get_attachment_image_url( $p->get_image_id(), 'medium' );
+            $short = wp_strip_all_tags( (string) $p->get_short_description() );
+            return [
+                'id'           => $pid,
+                'sku'          => $p->get_sku(),
+                'name'         => $p->get_name(),
+                'slug'         => $p->get_slug(),
+                'price'        => (float) $p->get_price(),
+                'regularPrice' => (float) $p->get_regular_price(),
+                'salePrice'    => $p->is_on_sale() ? (float) $p->get_sale_price() : null,
+                'stock'        => $p->get_stock_quantity(),
+                'stockStatus'  => $p->get_stock_status(),
+                'manageStock'  => $p->get_manage_stock(),
+                'taxClass'     => $p->get_tax_class(),
+                'taxStatus'    => $p->get_tax_status(),
+                'type'         => $p->get_type(),
+                'shortDesc'    => mb_substr( $short, 0, 500 ),
+                // Backwards-compat: frontend pluginFetch leest images[] array
+                'images'       => $img ? [ [ 'url' => $img, 'alt' => '' ] ] : [],
+                'categories'   => wp_get_post_terms( $pid, 'product_cat', [ 'fields' => 'names' ] ),
+                'permalink'    => get_permalink( $pid ),
+                // Velden die light NIET levert maar volledige format_product wel
+                'description'  => null,
+                'ean'          => null,
+            ];
+        } catch ( \Throwable $e ) {
+            error_log( '[NWWS] format_product_light failed for product ' . $p->get_id() . ': ' . $e->getMessage() );
+            return [
+                'id'     => $p->get_id(),
+                'sku'    => method_exists( $p, 'get_sku' ) ? $p->get_sku() : null,
+                'name'   => method_exists( $p, 'get_name' ) ? $p->get_name() : '(format failed)',
+                '_error' => 'format_failed',
+            ];
+        }
+    }
+
+    private static function format_product( WC_Product $p ): array {
+        // v1.7 hardening: één kapot product (corrupte serialized meta, missing parent term,
+        // plugin-conflict) mag niet de hele page-fetch crashen. Bij exception: log + return
+        // minimal stub zodat de andere producten in de batch wel doorkomen.
+        try {
+            $images = array_map( fn( $id ) => [
+                'url' => wp_get_attachment_image_url( $id, 'full' ),
+                'alt' => get_post_meta( $id, '_wp_attachment_image_alt', true ),
+            ], array_filter( array_merge( [ $p->get_image_id() ], $p->get_gallery_image_ids() ) ) );
+
+            $variations = [];
+            if ( $p->is_type( 'variable' ) ) {
+                foreach ( $p->get_children() as $var_id ) {
+                    try {
+                        $v = wc_get_product( $var_id );
+                        if ( ! $v ) continue;
+                        $variations[] = [
+                            'id'         => $var_id,
+                            'sku'        => $v->get_sku(),
+                            'price'      => (float) $v->get_price(),
+                            'salePrice'  => $v->is_on_sale() ? (float) $v->get_sale_price() : null,
+                            'stock'      => $v->get_stock_quantity(),
+                            'attributes' => $v->get_variation_attributes(),
+                        ];
+                    } catch ( \Throwable $e ) {
+                        error_log( '[NWWS] variation ' . $var_id . ' failed: ' . $e->getMessage() );
+                    }
+                }
+            }
+
+            // Haal merk/kleur/maat op uit product attributes
+            $attrs = [];
+            foreach ( $p->get_attributes() as $attr ) {
+                try {
+                    $name = wc_attribute_label( $attr->get_name() );
+                    $vals = $attr->is_taxonomy()
+                        ? wc_get_product_terms( $p->get_id(), $attr->get_name(), [ 'fields' => 'names' ] )
+                        : $attr->get_options();
+                    $attrs[ strtolower( $name ) ] = implode( ', ', $vals );
+                } catch ( \Throwable $e ) {
+                    error_log( '[NWWS] attribute parse failed on ' . $p->get_id() . ': ' . $e->getMessage() );
+                }
+            }
+
+            $pid = $p->get_id();
+
+            return [
+                'id'             => $pid,
+                'sku'            => $p->get_sku(),
+                'name'           => $p->get_name(),
+                'slug'           => $p->get_slug(),
+                'description'    => NWWS_Content_Cleaner::clean( $p->get_description() ),
+                'shortDesc'      => NWWS_Content_Cleaner::clean( $p->get_short_description() ),
+                'price'          => (float) $p->get_price(),
+                'regularPrice'   => (float) $p->get_regular_price(),
+                'salePrice'      => $p->is_on_sale() ? (float) $p->get_sale_price() : null,
+                'stock'          => $p->get_stock_quantity(),
+                'stockStatus'    => $p->get_stock_status(),
+                'manageStock'    => $p->get_manage_stock(),
+                'backorders'     => $p->get_backorders() !== 'no',
+                'weight'         => $p->get_weight(),
+                'dimensions'     => [
+                    'length' => $p->get_length(),
+                    'width'  => $p->get_width(),
+                    'height' => $p->get_height(),
+                ],
+                'shippingClass'  => $p->get_shipping_class() ?: null,
+                'type'           => $p->get_type(), // simple | variable | grouped | external
+                'categories'     => wp_get_post_terms( $pid, 'product_cat', [ 'fields' => 'names' ] ),
+                'tags'           => wp_get_post_terms( $pid, 'product_tag', [ 'fields' => 'names' ] ),
+                'images'         => $images,
+                'attributes'     => $attrs,
+                'brand'          => $attrs['merk'] ?? $attrs['brand'] ?? null,
+                'ean'            => get_post_meta( $pid, '_ean', true )
+                                 ?: get_post_meta( $pid, '_gtin', true )
+                                 ?: get_post_meta( $pid, '_cr_gtin', true )
+                                 ?: null,
+                'variations'     => $variations,
+                'crossSells'     => self::format_related_products( $p->get_cross_sell_ids() ),
+                'upsells'        => self::format_related_products( $p->get_upsell_ids() ),
+                'addons'         => self::get_product_addons( $pid ),
+                'seo'            => self::get_seo_meta( $pid ),
+                'permalink'      => get_permalink( $pid ),
+                'createdAt'      => $p->get_date_created() ? $p->get_date_created()->date( 'c' ) : null,
+            ];
+        } catch ( \Throwable $e ) {
+            error_log( '[NWWS] format_product failed for product ' . $p->get_id() . ': ' . $e->getMessage() );
+            return [
+                'id'     => $p->get_id(),
+                'sku'    => method_exists( $p, 'get_sku' ) ? $p->get_sku() : null,
+                'name'   => method_exists( $p, 'get_name' ) ? $p->get_name() : '(format failed)',
+                '_error' => 'format_failed: ' . $e->getMessage(),
+            ];
+        }
     }
 
     /**
@@ -464,16 +863,20 @@ class NWWS_Migrator_API {
     private static function format_related_products( array $ids ): array {
         $out = [];
         foreach ( array_slice( array_filter( $ids ), 0, 20 ) as $id ) {
-            $rp = wc_get_product( (int) $id );
-            if ( ! $rp ) continue;
-            $out[] = [
-                'id'    => $rp->get_id(),
-                'sku'   => $rp->get_sku(),
-                'name'  => $rp->get_name(),
-                'slug'  => $rp->get_slug(),
-                'price' => (float) $rp->get_price(),
-                'image' => wp_get_attachment_image_url( $rp->get_image_id(), 'woocommerce_thumbnail' ) ?: null,
-            ];
+            try {
+                $rp = wc_get_product( (int) $id );
+                if ( ! $rp ) continue;
+                $out[] = [
+                    'id'    => $rp->get_id(),
+                    'sku'   => $rp->get_sku(),
+                    'name'  => $rp->get_name(),
+                    'slug'  => $rp->get_slug(),
+                    'price' => (float) $rp->get_price(),
+                    'image' => wp_get_attachment_image_url( $rp->get_image_id(), 'woocommerce_thumbnail' ) ?: null,
+                ];
+            } catch ( \Throwable $e ) {
+                error_log( '[NWWS] format_related_products failed for ' . $id . ': ' . $e->getMessage() );
+            }
         }
         return $out;
     }
@@ -481,8 +884,18 @@ class NWWS_Migrator_API {
     /**
      * Extract product add-on / extra options configuration.
      * Supports: TM Extra Product Options, WooSB bundles.
+     * v1.7: hardened met try/catch zodat corrupte serialized meta niet de hele page crasht.
      */
     private static function get_product_addons( int $pid ): array {
+        try {
+            return self::get_product_addons_inner( $pid );
+        } catch ( \Throwable $e ) {
+            error_log( '[NWWS] get_product_addons failed for ' . $pid . ': ' . $e->getMessage() );
+            return [];
+        }
+    }
+
+    private static function get_product_addons_inner( int $pid ): array {
         $result = [];
 
         // ── TM Extra Product Options ──────────────────────────────────────────
@@ -554,35 +967,80 @@ class NWWS_Migrator_API {
             ];
         }
 
-        return $result ?: null;
+        return $result ?: [];
     }
 
     // ─── WooCommerce Categories ───────────────────────────────────────────────
 
-    public static function get_categories(): WP_REST_Response {
+    public static function get_categories( WP_REST_Request $req ): WP_REST_Response {
         if ( ! class_exists( 'WooCommerce' ) ) {
             return new WP_REST_Response( [ 'error' => 'WooCommerce niet actief' ], 400 );
         }
 
-        $terms = get_terms( [
+        // v1.7: backwards-compat paginering. Pre-1.7 clients sturen geen page/per_page →
+        // krijg de volledige unpaginated lijst (oude gedrag). Nieuwe clients krijgen
+        // netjes paginated met total + pages voor frontend voortgangsbalk.
+        $page_param     = $req->get_param( 'page' );
+        $per_page_param = $req->get_param( 'per_page' );
+        $has_pagination = $page_param !== null && $per_page_param !== null;
+
+        // hide_empty: default false (alle cats incl. leeg). Frontend kan filteren.
+        $hide_empty = (bool) (int) ( $req->get_param( 'hide_empty' ) ?? 0 );
+
+        $args = [
             'taxonomy'   => 'product_cat',
-            'hide_empty' => false,
+            'hide_empty' => $hide_empty,
+        ];
+
+        $page = 1;
+        $per  = 0; // 0 = unlimited (oud gedrag)
+        if ( $has_pagination ) {
+            $page = max( 1, (int) $page_param );
+            // Plafond op 200 om OOM te voorkomen op shops met enorme cat-aantallen
+            $per  = min( 200, max( 1, (int) $per_page_param ) );
+            $args['number'] = $per;
+            $args['offset'] = ( $page - 1 ) * $per;
+        }
+
+        $terms = get_terms( $args );
+
+        // Total via wp_count_terms (1 SQL count) — onafhankelijk van paginering
+        $total = (int) wp_count_terms( [
+            'taxonomy'   => 'product_cat',
+            'hide_empty' => $hide_empty,
         ] );
 
         $data = array_map( function( $t ) {
-            $thumb_id = get_term_meta( $t->term_id, 'thumbnail_id', true );
-            return [
-                'id'          => $t->term_id,
-                'name'        => $t->name,
-                'slug'        => $t->slug,
-                'description' => wp_strip_all_tags( $t->description ),
-                'parentId'    => $t->parent ?: null,
-                'count'       => $t->count,
-                'image'       => $thumb_id ? wp_get_attachment_image_url( $thumb_id, 'full' ) : null,
-            ];
-        }, $terms ?: [] );
+            try {
+                $thumb_id = get_term_meta( $t->term_id, 'thumbnail_id', true );
+                return [
+                    'id'          => $t->term_id,
+                    'name'        => $t->name,
+                    'slug'        => $t->slug,
+                    'description' => wp_strip_all_tags( $t->description ),
+                    'parentId'    => $t->parent ?: null,
+                    'count'       => $t->count,
+                    'image'       => $thumb_id ? wp_get_attachment_image_url( $thumb_id, 'full' ) : null,
+                ];
+            } catch ( \Throwable $e ) {
+                error_log( '[NWWS] format_category failed for ' . $t->term_id . ': ' . $e->getMessage() );
+                return [
+                    'id'     => $t->term_id,
+                    'name'   => $t->name ?? '(format failed)',
+                    'slug'   => $t->slug ?? '',
+                    '_error' => 'format_failed',
+                ];
+            }
+        }, is_array( $terms ) ? $terms : [] );
 
-        return new WP_REST_Response( [ 'items' => $data, 'total' => count( $data ) ] );
+        return new WP_REST_Response( [
+            'items'    => $data,
+            'total'    => $total,
+            'page'     => $page,
+            'per_page' => $per,
+            'pages'    => $has_pagination && $per > 0 ? (int) ceil( $total / $per ) : 1,
+            'meta'     => self::meta_block(),
+        ] );
     }
 
     // ─── WooCommerce Orders ───────────────────────────────────────────────────
@@ -840,7 +1298,7 @@ class NWWS_Migrator_API {
                     'type'     => $method->id,
                     'title'    => $method->get_method_title(),
                     'cost'     => $method->get_option( 'cost' ) ?: null,
-                    'settings' => array_map( fn( $s ) => $s['value'], $method->instance_settings ),
+                    'settings' => array_map( fn( $s ) => is_array( $s ) ? ( $s['value'] ?? null ) : $s, $method->instance_settings ),
                 ];
             }
             $zones_data[] = [
@@ -877,15 +1335,15 @@ class NWWS_Migrator_API {
         $offset = ( $page - 1 ) * $per;
 
         $table = $wpdb->prefix . 'rank_math_redirections';
-        if ( $wpdb->get_var( "SHOW TABLES LIKE '$table'" ) !== $table ) {
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
             return new WP_REST_Response( [ 'error' => 'Rank Math redirections niet gevonden' ], 404 );
         }
 
         $rows  = $wpdb->get_results( $wpdb->prepare(
-            "SELECT * FROM $table WHERE status='active' ORDER BY id LIMIT %d OFFSET %d",
+            "SELECT * FROM {$wpdb->prefix}rank_math_redirections WHERE status='active' ORDER BY id LIMIT %d OFFSET %d",
             $per, $offset
         ) );
-        $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table WHERE status='active'" );
+        $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->prefix}rank_math_redirections WHERE status='active'" );
 
         $data = array_map( function( $row ) {
             $sources = maybe_unserialize( $row->sources );
@@ -1092,8 +1550,17 @@ class NWWS_Migrator_API {
         $locations     = get_nav_menu_locations();
         $loc_by_menu   = array_flip( $locations ); // term_id => location_slug
 
+        // WPML_LS_Render hooks into wp_get_nav_menu_items to inject language-switcher items.
+        // On multilingual sites this filter calls wp_get_nav_menu_items() recursively,
+        // causing an infinite loop. Remove it for this migration-only read and restore after.
+        global $wp_filter;
+        $saved_nav_filters = $wp_filter['wp_get_nav_menu_items'] ?? null;
+        remove_all_filters( 'wp_get_nav_menu_items' );
+
         foreach ( $menus as $menu ) {
-            $flat_items = wp_get_nav_menu_items( $menu->term_id );
+            // suppress_filters=true: prevents WPML/WCML from intercepting the WP_Query
+            // (posts_where / posts_join filters) that loads nav_menu_item posts.
+            $flat_items = wp_get_nav_menu_items( $menu->term_id, [ 'suppress_filters' => true ] );
             if ( ! $flat_items ) $flat_items = [];
 
             // Build rich item map
@@ -1126,6 +1593,11 @@ class NWWS_Migrator_API {
                 'location' => $loc_by_menu[ $menu->term_id ] ?? null,
                 'items'    => $tree,
             ];
+        }
+
+        // Restore wp_get_nav_menu_items filters removed above.
+        if ( $saved_nav_filters !== null ) {
+            $wp_filter['wp_get_nav_menu_items'] = $saved_nav_filters;
         }
 
         return new WP_REST_Response( [ 'items' => $data ] );
@@ -1352,6 +1824,137 @@ class NWWS_Migrator_API {
         ] );
     }
 
+    // ─── Media binary stream (hotlink/WAF bypass) ─────────────────────────────
+
+    /**
+     * Streamt een /wp-content/uploads/ bestand binair via PHP.
+     *
+     * Waarom:
+     *   Cloudflare/Wordfence hotlink-protection blokkeert externe origins die
+     *   afbeeldingen rechtstreeks ophalen. De Neuramerce migrator moet wel bij
+     *   de bron-bytes om te kunnen rehosten — dit endpoint doet dat met onze
+     *   eigen API-key in plaats van publieke hotlinks.
+     *
+     * Beveiliging:
+     *   - Host moet exact matchen met home_url() — voorkomt SSRF naar willekeurige
+     *     domeinen via een opgegeven URL.
+     *   - Pad moet onder de WordPress uploads-directory liggen, geverifieerd via
+     *     realpath() vergelijking — voorkomt path traversal (../) aanvallen.
+     *   - Bestand mag max 20 MB zijn — voorkomt geheugen-uitputting en misbruik.
+     *   - Auth via bestaande X-Neuramerce-Key / Bearer token check.
+     */
+    public static function get_media_binary( WP_REST_Request $req ) {
+        $raw = sanitize_text_field( (string) $req->get_param( 'url' ) );
+        if ( ! filter_var( $raw, FILTER_VALIDATE_URL ) ) {
+            return new WP_Error( 'invalid_url', 'Ongeldige URL', [ 'status' => 400 ] );
+        }
+
+        // Host match check — alleen onze eigen site mag worden uitgelezen
+        $req_parts  = parse_url( $raw );
+        $site_parts = parse_url( home_url() );
+        $req_host   = strtolower( $req_parts['host']  ?? '' );
+        $site_host  = strtolower( $site_parts['host'] ?? '' );
+        if ( ! $req_host || $req_host !== $site_host ) {
+            return new WP_Error( 'host_mismatch', 'URL hoort niet bij deze site', [ 'status' => 403 ] );
+        }
+
+        $path = $req_parts['path'] ?? '';
+        if ( ! str_contains( $path, '/wp-content/uploads/' ) ) {
+            return new WP_Error( 'not_uploads', 'URL valt niet binnen /wp-content/uploads/', [ 'status' => 403 ] );
+        }
+
+        // Bouw lokaal bestandspad via wp_upload_dir() — veiliger dan ABSPATH concat
+        $upload  = wp_upload_dir();
+        $basedir = $upload['basedir'] ?? '';
+        $baseurl = $upload['baseurl'] ?? '';
+
+        // Vervang baseurl door basedir om naar het lokale pad te mappen.
+        // Strip query/fragment van de input voordat we vergelijken.
+        $clean_url = ( $req_parts['scheme'] ?? 'https' ) . '://' . $req_host . $path;
+        if ( ! str_starts_with( $clean_url, $baseurl ) ) {
+            // Fallback: misschien staat baseurl op http vs https mismatch — vergelijk pad-segment
+            $base_path = parse_url( $baseurl, PHP_URL_PATH ) ?? '/wp-content/uploads';
+            if ( ! str_starts_with( $path, $base_path ) ) {
+                return new WP_Error( 'not_uploads', 'Pad valt buiten uploads dir', [ 'status' => 403 ] );
+            }
+            $relative = substr( $path, strlen( $base_path ) );
+            $file     = $basedir . $relative;
+        } else {
+            $file = $basedir . substr( $clean_url, strlen( $baseurl ) );
+        }
+
+        // Bestaat het bestand?
+        if ( ! file_exists( $file ) || ! is_file( $file ) ) {
+            return new WP_Error( 'not_found', 'Bestand niet gevonden', [ 'status' => 404 ] );
+        }
+
+        // Path traversal verdediging — realpath van zowel bestand als basedir,
+        // controleer dat het opgeloste pad onder de uploads-root ligt.
+        $real_file = realpath( $file );
+        $real_base = realpath( $basedir );
+        if ( ! $real_file || ! $real_base || ! str_starts_with( $real_file, $real_base . DIRECTORY_SEPARATOR ) ) {
+            return new WP_Error( 'forbidden', 'Pad valt buiten uploads dir', [ 'status' => 403 ] );
+        }
+
+        // Filesize check — bescherm tegen memory blow-ups
+        $size = filesize( $real_file );
+        if ( $size === false ) {
+            return new WP_Error( 'stat_failed', 'Kan bestandsgrootte niet bepalen', [ 'status' => 500 ] );
+        }
+        $max = 20 * 1024 * 1024; // 20 MB
+        if ( $size > $max ) {
+            return new WP_Error( 'too_large', 'Bestand te groot (>20MB)', [ 'status' => 413 ] );
+        }
+
+        // MIME-type bepalen
+        $type_info = wp_check_filetype( $real_file );
+        $mime      = $type_info['type'] ?? null;
+        if ( ! $mime && function_exists( 'finfo_open' ) ) {
+            $finfo = finfo_open( FILEINFO_MIME_TYPE );
+            if ( $finfo ) {
+                $mime = finfo_file( $finfo, $real_file ) ?: null;
+                finfo_close( $finfo );
+            }
+        }
+        $mime = $mime ?: 'application/octet-stream';
+
+        // Stream het bestand naar de client en stop WP voordat het iets toevoegt
+        status_header( 200 );
+        nocache_headers(); // Verwijder WP's no-cache; we zetten zelf cache-control hieronder
+        header( 'Content-Type: ' . $mime );
+        header( 'Content-Length: ' . $size );
+        header( 'Cache-Control: public, max-age=3600' );
+        header( 'X-Content-Type-Options: nosniff' );
+
+        readfile( $real_file );
+        exit;
+    }
+
+    /**
+     * Diagnose endpoint — geeft uploads dir + eerste paar .jpg bestanden terug
+     * zodat developers kunnen verifiëren dat de media-binary streamer werkt
+     * zonder een specifieke URL nodig te hebben.
+     */
+    public static function get_media_binary_test(): WP_REST_Response {
+        $upload  = wp_upload_dir();
+        $basedir = $upload['basedir'] ?? '';
+
+        $samples = [];
+        if ( $basedir && is_dir( $basedir ) ) {
+            $files = glob( $basedir . '/*.jpg' ) ?: [];
+            foreach ( array_slice( $files, 0, 3 ) as $f ) {
+                $samples[] = basename( $f );
+            }
+        }
+
+        return new WP_REST_Response( [
+            'ok'           => true,
+            'version'      => defined( 'NWWS_VERSION' ) ? NWWS_VERSION : null,
+            'uploads_dir'  => $basedir,
+            'sample_files' => $samples,
+        ] );
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /**
@@ -1559,5 +2162,247 @@ class NWWS_Migrator_API {
     private static function wpml_restore_language( ?string $lang ): void {
         if ( $lang === null ) return;
         do_action( 'wpml_switch_language', $lang );
+    }
+
+    // ─── Order statussen + stock-teksten — push vanuit Neuramerce ────────────
+
+    /**
+     * Dispatch /order-statuses naar GET (live-fetch) of POST (sync).
+     *
+     * Review-fix v1.11.0: één register_rest_route call met dual-method-mask
+     * voorkomt edge-case op multisite waar twee aparte route-registraties
+     * elkaar kunnen overriden bij dubbele plugin-init.
+     */
+    public static function order_statuses_dispatch( WP_REST_Request $req ) {
+        return $req->get_method() === 'GET'
+            ? self::get_order_statuses_live( $req )
+            : self::sync_order_statuses( $req );
+    }
+
+    /**
+     * Vervang de volledige lijst custom orderstatussen met de payload uit Neura.
+     * Volgens dit patroon ondersteunen we ook deletes (Neura-snapshot is leidend).
+     *
+     * Statussen worden opgeslagen in WP option 'nwws_custom_order_statuses' en
+     * geregistreerd via register_post_status() + wc_order_statuses filter (zie
+     * neura-wp-woo-sync-server.php → nwws_register_custom_statuses).
+     */
+    public static function sync_order_statuses( WP_REST_Request $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) {
+            return new WP_Error( 'invalid_body', 'Verwacht een JSON array', [ 'status' => 400 ] );
+        }
+
+        $clean = [];
+        foreach ( $body as $row ) {
+            if ( ! is_array( $row ) || empty( $row['key'] ) ) continue;
+            $clean[] = [
+                'key'             => sanitize_key( (string) $row['key'] ),
+                'label'           => sanitize_text_field( (string) ( $row['label'] ?? $row['key'] ) ),
+                'color'           => sanitize_text_field( (string) ( $row['color'] ?? '#a78bfa' ) ),
+                'wc_maps_to'      => isset( $row['wc_maps_to'] ) ? sanitize_key( (string) $row['wc_maps_to'] ) : '',
+                'counts_as_paid'  => ! empty( $row['counts_as_paid'] ),
+                'is_active'       => isset( $row['is_active'] ) ? (bool) $row['is_active'] : true,
+            ];
+        }
+
+        update_option( 'nwws_custom_order_statuses', $clean, false );
+
+        return new WP_REST_Response( [ 'ok' => true, 'count' => count( $clean ) ] );
+    }
+
+    /**
+     * GET /order-statuses — v1.11.0 live-fetch (S5).
+     *
+     * Returnt actieve wc-<key> post_statuses zoals WC ze daadwerkelijk kent
+     * via get_post_stati(). Bron-van-waarheid voor Neura's
+     * safeguard_status_mapping_consistency — als WP-option `nwws_custom_order_statuses`
+     * de status bevat maar register_post_status-hook is om de een of andere
+     * reden niet gelopen, valt dat hier op (status staat in option maar niet
+     * in registry).
+     *
+     * Response shape:
+     *   {
+     *     "registered_post_statuses": [{ key: "wc-naar-warehouse", label: "Naar warehouse" }, ...],
+     *     "wc_order_statuses":        [{ key: "wc-processing", label: "Processing" }, ...],
+     *     "stored_in_option":         [{ key, label, color, wc_maps_to, counts_as_paid, is_active }, ...],
+     *     "plugin_version":           "1.11.0"
+     *   }
+     */
+    public static function get_order_statuses_live( WP_REST_Request $req ) {
+        // 1. Alle geregistreerde post_status met `wc-`-prefix uit registry.
+        //    get_post_stati() returnt ALLE post_status objects — we filteren op
+        //    naam en mappen naar key+label.
+        $all_post_statuses = get_post_stati( [], 'objects' );
+        $registered = [];
+        foreach ( $all_post_statuses as $key => $obj ) {
+            if ( strpos( $key, 'wc-' ) !== 0 ) continue;
+            $registered[] = [
+                'key'   => $key,
+                'label' => isset( $obj->label ) ? (string) $obj->label : $key,
+            ];
+        }
+
+        // 2. WC's eigen wc_get_order_statuses() — deze respecteert de
+        //    `wc_order_statuses`-filter en is wat de admin-dropdown gebruikt.
+        $wc_statuses = function_exists( 'wc_get_order_statuses' ) ? wc_get_order_statuses() : [];
+        $wc_list = [];
+        foreach ( $wc_statuses as $key => $label ) {
+            $wc_list[] = [
+                'key'   => sanitize_key( $key ),
+                'label' => sanitize_text_field( (string) $label ),
+            ];
+        }
+
+        // 3. Wat in WP-option staat — voor diff-detectie ("option zegt X maar
+        //    registry kent X niet" = drift, register_post_status hook gemist).
+        $stored = get_option( 'nwws_custom_order_statuses', [] );
+        if ( ! is_array( $stored ) ) $stored = [];
+
+        return new WP_REST_Response( [
+            'registered_post_statuses' => $registered,
+            'wc_order_statuses'        => $wc_list,
+            'stored_in_option'         => $stored,
+            'plugin_version'           => defined( 'NWWS_VERSION' ) ? NWWS_VERSION : 'unknown',
+            'fetched_at'               => current_time( 'c' ),
+        ] );
+    }
+
+    /**
+     * Bulk-update voorraadstatus-tekst op WC-producten en -categorieën.
+     * Slaat op als post_meta '_nwws_stock_status_text' resp. term_meta met
+     * dezelfde key. Wordt gerenderd door de woocommerce_get_availability filter
+     * in neura-wp-woo-sync-server.php (vervangt Woo Custom Stock Status Pro).
+     *
+     * Body: { products: [{ wp_id: 123, text: "..." }], categories: [...] }
+     * `text: null` (of lege string) → meta verwijderen → val terug op WC-default.
+     */
+    public static function sync_stock_texts( WP_REST_Request $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) {
+            return new WP_Error( 'invalid_body', 'Verwacht een JSON object', [ 'status' => 400 ] );
+        }
+
+        $products   = is_array( $body['products']   ?? null ) ? $body['products']   : [];
+        $categories = is_array( $body['categories'] ?? null ) ? $body['categories'] : [];
+
+        $product_count  = 0;
+        $category_count = 0;
+
+        foreach ( $products as $row ) {
+            if ( ! is_array( $row ) || empty( $row['wp_id'] ) ) continue;
+            $pid  = absint( $row['wp_id'] );
+            $text = isset( $row['text'] ) && $row['text'] !== null ? sanitize_text_field( (string) $row['text'] ) : '';
+
+            if ( $text === '' ) {
+                delete_post_meta( $pid, '_nwws_stock_status_text' );
+            } else {
+                update_post_meta( $pid, '_nwws_stock_status_text', $text );
+            }
+            $product_count++;
+        }
+
+        foreach ( $categories as $row ) {
+            if ( ! is_array( $row ) || empty( $row['wp_id'] ) ) continue;
+            $tid  = absint( $row['wp_id'] );
+            $text = isset( $row['text'] ) && $row['text'] !== null ? sanitize_text_field( (string) $row['text'] ) : '';
+
+            if ( $text === '' ) {
+                delete_term_meta( $tid, '_nwws_stock_status_text' );
+            } else {
+                update_term_meta( $tid, '_nwws_stock_status_text', $text );
+            }
+            $category_count++;
+        }
+
+        return new WP_REST_Response( [
+            'ok'         => true,
+            'products'   => $product_count,
+            'categories' => $category_count,
+        ] );
+    }
+
+    /**
+     * Zet custom status (wc-<key>) op een specifieke WC-order plus optionele
+     * leverdatum als order-meta. Gebruikt $order->set_status() (HPOS-compat,
+     * werkt op zowel post-status- als COT-mode).
+     *
+     * Body: { status_key: "delivery-planned", planned_delivery_at?: "2026-05-10T12:00:00.000Z" }
+     */
+    public static function set_order_status( WP_REST_Request $req ) {
+        $order_id = absint( $req->get_param( 'id' ) );
+        $body     = $req->get_json_params();
+
+        if ( ! is_array( $body ) || empty( $body['status_key'] ) ) {
+            return new WP_Error( 'invalid_body', 'status_key vereist', [ 'status' => 400 ] );
+        }
+
+        $order = wc_get_order( $order_id );
+        if ( ! $order ) {
+            return new WP_Error( 'not_found', 'Order niet gevonden', [ 'status' => 404 ] );
+        }
+
+        $status_key = sanitize_key( (string) $body['status_key'] );
+
+        // Verifieer dat deze status bestaat in onze lijst — voorkomt arbitrary status injecten
+        $known = get_option( 'nwws_custom_order_statuses', [] );
+        $valid_keys = array_column( is_array( $known ) ? $known : [], 'key' );
+        if ( ! in_array( $status_key, $valid_keys, true ) ) {
+            return new WP_Error( 'unknown_status', 'Onbekende status — sync eerst /order-statuses', [ 'status' => 400 ] );
+        }
+
+        $order->set_status( 'wc-' . $status_key, 'Status gezet via Neura' );
+
+        if ( ! empty( $body['planned_delivery_at'] ) ) {
+            $order->update_meta_data( '_nwws_planned_delivery_at', sanitize_text_field( (string) $body['planned_delivery_at'] ) );
+        } else {
+            $order->delete_meta_data( '_nwws_planned_delivery_at' );
+        }
+
+        $order->save();
+
+        return new WP_REST_Response( [
+            'ok'         => true,
+            'order_id'   => $order_id,
+            'status_key' => $status_key,
+        ] );
+    }
+
+    /**
+     * POST /shipping-schedules — slaat de volledige shipping-config op als 3
+     * WP-options. nwws_render_shipping_info (in main plugin) leest deze om
+     * "Vóór 16:00 besteld? Dinsdag verzonden." te tonen op productpagina's.
+     */
+    public static function sync_shipping_schedules( WP_REST_Request $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) {
+            return new WP_Error( 'invalid_body', 'Body moet JSON-object zijn', [ 'status' => 400 ] );
+        }
+
+        // Default schedule (workspace-breed). Vorm: { week_config, message_tpl }
+        if ( isset( $body['default'] ) && is_array( $body['default'] ) ) {
+            update_option( 'nwws_shipping_default', $body['default'], false );
+        } elseif ( array_key_exists( 'default', $body ) && $body['default'] === null ) {
+            delete_option( 'nwws_shipping_default' );
+        }
+
+        // Per-categorie overrides — array van { category_slug, week_config, message_tpl }
+        $overrides = isset( $body['overrides'] ) && is_array( $body['overrides'] )
+            ? array_values( $body['overrides'] )
+            : [];
+        update_option( 'nwws_shipping_overrides', $overrides, false );
+
+        // Datum-excepties — array van { date, type, label }
+        $exceptions = isset( $body['exceptions'] ) && is_array( $body['exceptions'] )
+            ? array_values( $body['exceptions'] )
+            : [];
+        update_option( 'nwws_shipping_exceptions', $exceptions, false );
+
+        return new WP_REST_Response( [
+            'ok'                => true,
+            'overrides_count'   => count( $overrides ),
+            'exceptions_count'  => count( $exceptions ),
+            'has_default'       => !empty( $body['default'] ),
+        ] );
     }
 }

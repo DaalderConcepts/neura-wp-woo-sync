@@ -1,10 +1,12 @@
 <?php
+declare(strict_types=1);
 /**
  * Parseert Gutenberg blocks (post_content) naar Neuramerce PageSection-structuur.
  *
  * Gutenberg slaat blocks op als HTML-commentaar: <!-- wp:heading -->..<!-- /wp:heading -->
  * We parsen de block-structuur en mappen naar dezelfde Neuramerce sectie-types als Elementor.
  */
+defined('ABSPATH') || exit;
 class NWWS_Gutenberg_Parser {
 
     /**
