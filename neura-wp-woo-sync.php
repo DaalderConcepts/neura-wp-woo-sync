@@ -4,7 +4,7 @@ declare(strict_types=1);
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.11.0
+ * Version:      1.11.1
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -17,7 +17,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.11.0');
+define('NWWS_VERSION',    '1.11.1');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -620,7 +620,7 @@ JS;
             // (auto-fetch pas hier zodat POST-waarden niet overschreven worden door de fetch)
             $current_inbox_key = get_option('nwws_chat_inbox_key', '');
             if (!empty($new_api_key) && !empty($new_conn_id) && empty($current_inbox_key)) {
-                $config_url = rtrim($new_api_url ?: 'https://app.neuramerce.com/api', '/') . '/woocommerce/workspace-config';
+                $config_url = rtrim($new_api_url ?: 'https://app.neuramerce.com/api', '/') . '/v1/woocommerce/workspace-config';
                 $config_res = wp_remote_get(add_query_arg('connectionId', rawurlencode($new_conn_id), $config_url), [
                     'headers' => ['X-Neuramerce-Plugin-Key' => $new_api_key],
                     'timeout' => 10,
@@ -773,7 +773,7 @@ JS;
      */
     private function do_fetch_workspace_config(string $api_key, string $conn_id): string {
         $api_url    = get_option('nwws_api_url', 'https://app.neuramerce.com/api');
-        $config_url = rtrim($api_url, '/') . '/woocommerce/workspace-config';
+        $config_url = rtrim($api_url, '/') . '/v1/woocommerce/workspace-config';
         $response   = wp_remote_get(
             add_query_arg('connectionId', rawurlencode($conn_id), $config_url),
             ['headers' => ['X-Neuramerce-Plugin-Key' => $api_key], 'timeout' => 8, 'sslverify' => true]
@@ -1760,7 +1760,7 @@ JS;
         // Wis transient zodat we een verse call doen
         delete_transient('nwws_config_synced');
 
-        $config_url = rtrim($api_url, '/') . '/woocommerce/workspace-config';
+        $config_url = rtrim($api_url, '/') . '/v1/woocommerce/workspace-config';
         $request_url = add_query_arg('connectionId', rawurlencode($conn_id), $config_url);
 
         $response = wp_remote_get($request_url, [
