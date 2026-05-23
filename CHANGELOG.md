@@ -1,5 +1,10 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.11.1] — 2026-05-23
+
+### Fixed
+- **`/api/woocommerce/workspace-config` callt nu `/api/v1/woocommerce/workspace-config`** (ADR-002 Fase 1 alignment). 3 plekken in `neura-wp-woo-sync.php` (regels 623, 776, 1763) — config-fetch tijdens settings-save, `do_fetch_workspace_config()` AJAX-handler en auto-refetch via transient. Pre-fix werkte via 308-redirect-stub op Neura backend; post-fix is directe v1-call (geen extra round-trip). Veronderstelt `nwws_api_url` eindigt op `/api` (zonder `/v1`) — default sinds installatie. Sites die zelf `nwws_api_url` op `.../api/v1` hebben gezet krijgen `.../api/v1/v1/woocommerce/workspace-config` (double `/v1/`); workaround: reset URL naar `.../api`
+
 ## [1.11.0] — 2026-05-05
 
 ### Added
