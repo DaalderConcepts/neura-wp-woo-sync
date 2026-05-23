@@ -1,6 +1,7 @@
 <?php
+declare(strict_types=1);
 /**
- * Migratie naar Neuramerce — tab in Ads Machine plugin
+ * Migratie naar Neuramerce — tab in Neuramerce plugin
  */
 defined('ABSPATH') || exit;
 
@@ -48,13 +49,13 @@ $count_reviews  = $wc_active ? (int) get_comments(['type' => 'review', 'status' 
         <h2>🚀 Migreer naar Neuramerce</h2>
         <p>Jouw website, producten, reviews en bestellingen — volledig overgezet naar Neuramerce. Inclusief Gutenberg en Elementor content.</p>
         <div class="nm-stat-row">
-            <div class="nm-stat"><strong><?= $count_pages ?></strong><span>Pagina's</span></div>
-            <div class="nm-stat"><strong><?= $count_posts ?></strong><span>Blog posts</span></div>
+            <div class="nm-stat"><strong><?php echo (int) $count_pages; ?></strong><span>Pagina's</span></div>
+            <div class="nm-stat"><strong><?php echo (int) $count_posts; ?></strong><span>Blog posts</span></div>
             <?php if ($wc_active): ?>
-            <div class="nm-stat"><strong><?= $count_products ?></strong><span>Producten</span></div>
-            <div class="nm-stat"><strong><?= $count_reviews ?></strong><span>Reviews</span></div>
+            <div class="nm-stat"><strong><?php echo (int) $count_products; ?></strong><span>Producten</span></div>
+            <div class="nm-stat"><strong><?php echo (int) $count_reviews; ?></strong><span>Reviews</span></div>
             <?php endif; ?>
-            <div class="nm-stat"><strong><?= $count_media ?></strong><span>Media</span></div>
+            <div class="nm-stat"><strong><?php echo (int) $count_media; ?></strong><span>Media</span></div>
         </div>
     </div>
 
@@ -66,12 +67,12 @@ $count_reviews  = $wc_active ? (int) get_comments(['type' => 'review', 'status' 
             <div class="nm-card">
                 <h3>Gedetecteerde technologieën</h3>
                 <p style="margin:0">
-                    <?= $wc_active
-                        ? '<span class="nm-badge nm-badge-green">✓ WooCommerce</span> '
-                        : '<span class="nm-badge nm-badge-gray">WooCommerce niet actief</span> ' ?>
-                    <?= $el_active
-                        ? '<span class="nm-badge nm-badge-purple">✓ Elementor</span> '
-                        : '<span class="nm-badge nm-badge-gray">Gutenberg / Classic</span> ' ?>
+                    <?php echo $wc_active
+                        ? '<span class="nm-badge nm-badge-green">&#10003; WooCommerce</span> '
+                        : '<span class="nm-badge nm-badge-gray">WooCommerce niet actief</span> '; ?>
+                    <?php echo $el_active
+                        ? '<span class="nm-badge nm-badge-purple">&#10003; Elementor</span> '
+                        : '<span class="nm-badge nm-badge-gray">Gutenberg / Classic</span> '; ?>
                 </p>
                 <p style="margin:8px 0 0;font-size:13px;color:#666">
                     <?php if ($el_active): ?>
@@ -87,8 +88,8 @@ $count_reviews  = $wc_active ? (int) get_comments(['type' => 'review', 'status' 
                 <h3>Migrator API key</h3>
                 <?php if ($has_key): ?>
                     <p style="margin:0 0 8px;font-size:13px">Kopieer deze key naar de Neuramerce import-wizard:</p>
-                    <input type="text" class="nm-key-box" value="<?= esc_attr($api_key) ?>"
-                           readonly onclick="this.select(); document.execCommand('copy'); this.style.background='#d1fae5'; setTimeout(()=>this.style.background='#f6f7f8',1200)">
+                    <input type="text" class="nm-key-box" value="<?php echo esc_attr($api_key); ?>"
+                           readonly onclick="this.select(); document.execCommand('copy'); this.style.background='#d1fae5'; setTimeout(function(){this.style.background='#f6f7f8';}.bind(this),1200)">
                     <p style="margin:6px 0 12px;font-size:12px;color:#888">⚠ Behandel dit als een wachtwoord — deel alleen met Neuramerce.</p>
                     <form method="post" style="display:inline">
                         <?php wp_nonce_field('wcmac_migrator'); ?>
@@ -116,7 +117,7 @@ $count_reviews  = $wc_active ? (int) get_comments(['type' => 'review', 'status' 
                 <ol class="nm-steps">
                     <li>Log in op <strong>app.neuramerce.com</strong></li>
                     <li>Ga naar <strong>Import → WordPress</strong></li>
-                    <li>Vul je URL in: <code><?= esc_html($site_url) ?></code></li>
+                    <li>Vul je URL in: <code><?php echo esc_html($site_url); ?></code></li>
                     <li>Plak de API key hierboven</li>
                     <li>Klik <strong>Verbinding testen</strong> — Neuramerce haalt je site op</li>
                     <li>Kies wat je wilt importeren en klik <strong>Starten</strong></li>
@@ -133,10 +134,11 @@ $count_reviews  = $wc_active ? (int) get_comments(['type' => 'review', 'status' 
                     <tr><td style="padding:4px 0">📄 Pagina's + content</td><td style="text-align:right"><span class="nm-badge nm-badge-green">✓</span></td></tr>
                     <tr><td style="padding:4px 0">📝 Blog posts</td><td style="text-align:right"><span class="nm-badge nm-badge-green">✓</span></td></tr>
                     <tr><td style="padding:4px 0">🖼 Media bibliotheek</td><td style="text-align:right"><span class="nm-badge nm-badge-green">✓</span></td></tr>
-                    <tr><td style="padding:4px 0">🛒 WC Producten</td><td style="text-align:right"><span class="nm-badge <?= $wc_active ? 'nm-badge-green' : 'nm-badge-gray' ?>"><?= $wc_active ? '✓' : '—' ?></span></td></tr>
-                    <tr><td style="padding:4px 0">📦 Categorieën</td><td style="text-align:right"><span class="nm-badge <?= $wc_active ? 'nm-badge-green' : 'nm-badge-gray' ?>"><?= $wc_active ? '✓' : '—' ?></span></td></tr>
-                    <tr><td style="padding:4px 0">⭐ Reviews</td><td style="text-align:right"><span class="nm-badge <?= $wc_active ? 'nm-badge-green' : 'nm-badge-gray' ?>"><?= $wc_active ? '✓' : '—' ?></span></td></tr>
-                    <tr><td style="padding:4px 0">👥 Klanten</td><td style="text-align:right"><span class="nm-badge <?= $wc_active ? 'nm-badge-green' : 'nm-badge-gray' ?>"><?= $wc_active ? '✓' : '—' ?></span></td></tr>
+                    <?php $wc_badge_class = $wc_active ? 'nm-badge-green' : 'nm-badge-gray'; $wc_badge_icon = $wc_active ? '&#10003;' : '&mdash;'; ?>
+                    <tr><td style="padding:4px 0">WC Producten</td><td style="text-align:right"><span class="nm-badge <?php echo esc_attr($wc_badge_class); ?>"><?php echo $wc_badge_icon; ?></span></td></tr>
+                    <tr><td style="padding:4px 0">Categorie&euml;n</td><td style="text-align:right"><span class="nm-badge <?php echo esc_attr($wc_badge_class); ?>"><?php echo $wc_badge_icon; ?></span></td></tr>
+                    <tr><td style="padding:4px 0">Reviews</td><td style="text-align:right"><span class="nm-badge <?php echo esc_attr($wc_badge_class); ?>"><?php echo $wc_badge_icon; ?></span></td></tr>
+                    <tr><td style="padding:4px 0">Klanten</td><td style="text-align:right"><span class="nm-badge <?php echo esc_attr($wc_badge_class); ?>"><?php echo $wc_badge_icon; ?></span></td></tr>
                     <tr><td style="padding:4px 0">🗂 Navigatiemenu's</td><td style="text-align:right"><span class="nm-badge nm-badge-green">✓</span></td></tr>
                     <tr><td style="padding:4px 0">🎨 Design tokens</td><td style="text-align:right"><span class="nm-badge nm-badge-purple">~</span></td></tr>
                     <tr><td style="padding:4px 0">🔍 SEO meta (Yoast/RM)</td><td style="text-align:right"><span class="nm-badge nm-badge-green">✓</span></td></tr>
@@ -145,7 +147,7 @@ $count_reviews  = $wc_active ? (int) get_comments(['type' => 'review', 'status' 
 
             <div class="nm-card">
                 <h3>API endpoint</h3>
-                <code style="font-size:11px;word-break:break-all"><?= esc_html($endpoint) ?></code>
+                <code style="font-size:11px;word-break:break-all"><?php echo esc_html($endpoint); ?></code>
                 <p style="margin:8px 0 0;font-size:12px;color:#888">
                     Beschikbaar zodra je een API key hebt gegenereerd.
                     Stuur de <code>X-Neuramerce-Key</code> header mee bij elke request.

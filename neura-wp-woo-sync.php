@@ -1,9 +1,10 @@
 <?php
+declare(strict_types=1);
 /**
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.3.12
+ * Version:      1.11.0
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -16,7 +17,7 @@
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.3.12');
+define('NWWS_VERSION',    '1.11.0');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -35,12 +36,11 @@ $nwws_wc_active = in_array('woocommerce/woocommerce.php', apply_filters('active_
     || array_key_exists('woocommerce/woocommerce.php', (array) get_site_option('active_sitewide_plugins', []));
 
 if ( ! $nwws_wc_active ) {
-    // Register Migrator API routes even without WooCommerce
-    add_action('rest_api_init', ['NWWS_Migrator_API', 'register_routes']);
+    // Show admin notice — WC sync disabled, but Migrator API and full settings page remain available
     add_action('admin_notices', function () {
         echo '<div class="notice notice-warning"><p><strong>Neura WooCommerce Sync</strong>: WooCommerce niet gevonden — WooCommerce sync is uitgeschakeld. De Migrator API is wel beschikbaar.</p></div>';
     });
-    return;
+    // Do NOT return — let the main class boot so the full settings page (chat, API key, etc.) is accessible
 }
 
 // Declare HPOS (Custom Order Tables) compatibility
@@ -75,21 +75,30 @@ class Neura_GitHub_Updater {
     }
 
     private function get_release(): ?array {
-        $cache_key = 'nwws_github_release';
-        $cached    = get_transient($cache_key);
+        $cache_key      = 'nwws_github_release';
+        $fail_cache_key = 'nwws_github_release_fail';
+
+        $cached = get_transient($cache_key);
         if ($cached !== false) return $cached;
+
+        // Don't retry within 30 min after a failed call (prevents blocking on every admin page)
+        if (get_transient($fail_cache_key)) return null;
 
         $response = wp_remote_get(
             "https://api.github.com/repos/{$this->owner}/{$this->repo}/releases/latest",
-            ['headers' => ['Accept' => 'application/vnd.github+json', 'User-Agent' => 'WordPress/' . get_bloginfo('version')], 'timeout' => 15]
+            ['headers' => ['Accept' => 'application/vnd.github+json', 'User-Agent' => 'WordPress/' . get_bloginfo('version')], 'timeout' => 5]
         );
 
         if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+            set_transient($fail_cache_key, 1, 30 * MINUTE_IN_SECONDS);
             return null;
         }
 
         $data = json_decode(wp_remote_retrieve_body($response), true);
-        if (!isset($data['tag_name'])) return null;
+        if (!isset($data['tag_name'])) {
+            set_transient($fail_cache_key, 1, 30 * MINUTE_IN_SECONDS);
+            return null;
+        }
 
         // Prefer a release asset ZIP (correct folder structure) over the raw zipball
         $zip_url = $data['zipball_url'];
@@ -109,7 +118,7 @@ class Neura_GitHub_Updater {
             'published'   => $data['published_at'] ?? '',
         ];
 
-        set_transient($cache_key, $release, 6 * HOUR_IN_SECONDS);
+        set_transient($cache_key, $release, 12 * HOUR_IN_SECONDS);
         return $release;
     }
 
@@ -195,6 +204,52 @@ class Neura_WooCommerce_Sync {
         add_action('woocommerce_new_product',         [$this, 'sync_new_product'],      10, 1);
         add_action('woocommerce_update_product',      [$this, 'sync_product_update'],   10, 1);
 
+        // Custom WooCommerce order status: "Naar warehouse" — gezet door Neuramerce
+        // wanneer een order naar een warehouse (GP/WO) is doorgestuurd. Hierdoor
+        // ziet de webshop-eigenaar in de Woo admin direct dat een order in
+        // fulfillment-flow zit, en blijft 'Verwerken' gereserveerd voor orders
+        // die nog door de operator opgepakt moeten worden.
+        add_action('init',                                       [$this, 'register_naar_warehouse_status']);
+        add_filter('wc_order_statuses',                          [$this, 'add_naar_warehouse_to_order_statuses']);
+        add_filter('woocommerce_order_is_paid_statuses',         [$this, 'mark_naar_warehouse_as_paid']);
+        add_filter('woocommerce_reports_order_statuses',         [$this, 'mark_naar_warehouse_for_reports']);
+        add_filter('woocommerce_valid_order_statuses_for_payment_complete', [$this, 'mark_naar_warehouse_payment_complete']);
+
+        // v1.11.0 — Multi-warehouse split-shipments krijgen 'wc-partially-shipped'
+        // status zodra Neura's Postgres-trigger detecteert dat sommige (niet
+        // alle) regels al verzonden zijn. Geeft klant + WC-admin duidelijk
+        // beeld bij split-orders Eindhoven/Venlo etc.
+        add_action('init',                                                  [$this, 'register_partially_shipped_status']);
+        add_filter('wc_order_statuses',                                     [$this, 'add_partially_shipped_to_order_statuses']);
+        add_filter('woocommerce_order_is_paid_statuses',                    [$this, 'mark_partially_shipped_as_paid']);
+        add_filter('woocommerce_reports_order_statuses',                    [$this, 'mark_partially_shipped_for_reports']);
+        add_filter('woocommerce_valid_order_statuses_for_payment_complete', [$this, 'mark_partially_shipped_payment_complete']);
+        // HPOS-compat (review-fix): WC 8.x slaat order-status op in wc_orders.status
+        // tabel ipv post_status. Zonder deze filter valt de status uit de admin-
+        // dropdown wanneer custom_orders_table_usage_is_enabled() true is.
+        add_filter('woocommerce_register_shop_order_post_statuses',         [$this, 'add_partially_shipped_to_post_statuses']);
+
+        // v1.11.0 — Voorkom dubbele klant-mails: WC's eigen mailer onderdrukken
+        // voor custom statussen waar Neura zelf via inbox-template-engine mailt
+        // (snooze, partially_shipped). Klant krijgt anders WC-default mail +
+        // Neura-mail voor zelfde event.
+        add_filter('woocommerce_email_enabled_customer_on_hold_order',  [$this, 'maybe_suppress_default_email'], 10, 3);
+        add_filter('woocommerce_email_enabled_customer_processing_order', [$this, 'maybe_suppress_default_email'], 10, 3);
+        add_filter('woocommerce_email_enabled_customer_completed_order',  [$this, 'maybe_suppress_default_email'], 10, 3);
+
+        // v1.3.0 — Custom orderstatussen + voorraadtekst (Neura beheert de definities,
+        // pusht naar WP-option `nwws_custom_order_statuses`. Hieronder de WC-integraties
+        // die ervoor zorgen dat WC die statussen kent en stock-tekst toont op productpagina.)
+        add_action('init',                               [$this, 'nwws_register_custom_statuses'], 11);
+        add_filter('wc_order_statuses',                  [$this, 'nwws_add_custom_statuses_to_dropdown']);
+        add_filter('woocommerce_order_is_paid_statuses', [$this, 'nwws_mark_custom_paid']);
+        add_filter('woocommerce_reports_order_statuses', [$this, 'nwws_include_custom_in_reports']);
+        // Voorraadstatus-tekst override (per-product > per-categorie > WC default).
+        add_filter('woocommerce_get_availability',       [$this, 'nwws_filter_availability'], 10, 2);
+        // Dynamisch verzendregeltje op productpagina ("Vóór 16:00 besteld? Dinsdag verzonden.").
+        // Priority 25 = na price (10), voor add-to-cart (30).
+        add_action('woocommerce_single_product_summary', [$this, 'nwws_render_shipping_info'], 25);
+
         // COGS custom fields
         add_action('woocommerce_product_options_pricing',  [$this, 'add_cogs_field']);
         add_action('woocommerce_process_product_meta',     [$this, 'save_cogs_field']);
@@ -204,16 +259,46 @@ class Neura_WooCommerce_Sync {
         // Frontend chat widget + cart tracking
         add_action('wp_enqueue_scripts', [$this, 'enqueue_frontend_assets']);
 
+        // Prevent WP Rocket from minifying, caching, or delaying the Neuramerce widget script.
+        // Without these filters WP Rocket serves a locally-cached stale copy and marks it as
+        // text/rocketlazyloadscript, which delays the chat widget indefinitely.
+        add_filter('rocket_exclude_js',          [$this, 'rocket_exclude_widget']);
+        add_filter('rocket_delay_js_exclusions', [$this, 'rocket_exclude_widget']);
+        add_filter('rocket_minify_excluded_src', [$this, 'rocket_exclude_widget']);
+
+        // Attribution tracking script + WooCommerce purchase event
+        add_action('wp_enqueue_scripts', [$this, 'enqueue_tracking_script']);
+        add_action('woocommerce_thankyou', [$this, 'fire_purchase_event']);
+
         // REST API
         add_action('rest_api_init', [$this, 'register_rest_routes']);
         add_action('rest_api_init', ['NWWS_Migrator_API', 'register_routes']);
 
+        // Prevent CDN/proxy (Kinsta edge, Cloudflare) from caching REST responses.
+        // Kinsta's edge cache ignores Cache-Control: no-store; Vary: * is the
+        // standard RFC signal that a response must not be reused for any other request.
+        add_filter('rest_post_dispatch', function(WP_REST_Response $response, WP_REST_Server $server, WP_REST_Request $request): WP_REST_Response {
+            $route = $request->get_route();
+            if (str_starts_with($route, '/neuramerce/v1/') || str_starts_with($route, '/nwws/v1/')) {
+                $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+                $response->header('Pragma', 'no-cache');
+                $response->header('Vary', '*');
+                $response->header('Surrogate-Control', 'no-store');
+                $response->header('Expires', '0');
+            }
+            return $response;
+        }, 10, 3);
+
         // Background order/product sync (WP-Cron callback — MUST be registered or cron fires silently)
-        add_action('nwws_sync_order_bg',   [$this, 'sync_order'],   10, 1);
-        add_action('nwws_sync_product_bg', [$this, 'sync_product'], 10, 1);
+        add_action('nwws_sync_order_bg',        [$this, 'sync_order'],             10, 1);
+        add_action('nwws_sync_product_bg',       [$this, 'sync_product'],           10, 1);
+        add_action('nwws_track_conversion_bg',   [$this, 'run_track_conversion_bg'], 10, 1);
 
         // AJAX
+        add_action('admin_init',                      [$this, 'handle_setup_redirect']);
         add_action('wp_ajax_nwws_test_connection',    [$this, 'ajax_test_connection']);
+        add_action('wp_ajax_nwws_diagnostics',        [$this, 'ajax_diagnostics']);
+        add_action('wp_ajax_nwws_disconnect',         [$this, 'ajax_disconnect']);
         add_action('wp_ajax_nwws_sync_all_products',  [$this, 'ajax_sync_all_products']);
         add_action('wp_ajax_nwws_sync_all_orders',    [$this, 'ajax_sync_all_orders']);
         add_action('wp_ajax_nwws_get_sync_stats',     [$this, 'ajax_get_sync_stats']);
@@ -229,18 +314,30 @@ class Neura_WooCommerce_Sync {
     // =========================================================================
 
     public function add_admin_menu(): void {
-        add_submenu_page(
-            'woocommerce',
-            'Neura WooCommerce Sync',
-            'Neura Sync',
-            'manage_woocommerce',
-            'neura-wp-woo-sync',
-            [$this, 'render_settings_page']
-        );
+        if ( class_exists( 'WooCommerce' ) ) {
+            add_submenu_page(
+                'woocommerce',
+                'Neura WooCommerce Sync',
+                'Neura Sync',
+                'manage_woocommerce',
+                'neura-wp-woo-sync',
+                [$this, 'render_settings_page']
+            );
+        } else {
+            add_menu_page(
+                'Neuramerce',
+                'Neuramerce',
+                'manage_options',
+                'neura-wp-woo-sync',
+                [$this, 'render_settings_page'],
+                'dashicons-migrate',
+                80
+            );
+        }
     }
 
     public function enqueue_admin_assets(string $hook): void {
-        if ($hook !== 'woocommerce_page_neura-wp-woo-sync') return;
+        if ( ! in_array( $hook, [ 'woocommerce_page_neura-wp-woo-sync', 'toplevel_page_neura-wp-woo-sync' ], true ) ) return;
 
         wp_enqueue_style('nwws-admin',  NWWS_PLUGIN_URL . 'assets/css/admin.css', [], NWWS_VERSION);
         wp_enqueue_script('nwws-admin', NWWS_PLUGIN_URL . 'assets/js/admin.js',  ['jquery'], NWWS_VERSION, true);
@@ -261,10 +358,11 @@ class Neura_WooCommerce_Sync {
         $inbox_key = sanitize_text_field(get_option('nwws_chat_inbox_key', ''));
         if (empty($inbox_key)) return;
 
-        // Base URL: strip /api/... suffix from nwws_api_url if present, or use fallback
+        // Base URL: strip /api suffix (with or without trailing path) from nwws_api_url.
+        // Pattern: /api(/...)?$  — handles both "https://app.neuramerce.com/api" and ".../api/v1"
         $raw_url  = get_option('nwws_api_url', '');
         $base_url = $raw_url
-            ? rtrim(preg_replace('#/api/.*$#', '', $raw_url), '/')
+            ? rtrim(preg_replace('#/api(/.*)?$#', '', $raw_url), '/')
             : 'https://app.neuramerce.com';
 
         // Current cart data (safe for JS output)
@@ -272,7 +370,7 @@ class Neura_WooCommerce_Sync {
         $cart_total = 0.0;
         if (function_exists('WC') && WC()->cart && !is_admin()) {
             foreach (WC()->cart->get_cart() as $item) {
-                $product     = $item['data'] ?? null;
+                $product      = $item['data'] ?? null;
                 $cart_items[] = [
                     'product_id' => (int) $item['product_id'],
                     'name'       => $product ? wp_strip_all_tags($product->get_name()) : '',
@@ -283,32 +381,33 @@ class Neura_WooCommerce_Sync {
             $cart_total = (float) WC()->cart->get_cart_contents_total();
         }
 
-        // Register a dummy script handle so we can attach inline JS
-        wp_register_script('nwws-chat', false, [], NWWS_VERSION, true);
-        wp_enqueue_script('nwws-chat');
+        // Use data-widget-key attribute instead of ?key= URL param.
+        // WP Rocket and other caching plugins strip query params when minifying external scripts,
+        // which would make the widget unable to identify the inbox. HTML data-* attributes survive caching.
+        $widget_loader_url = esc_url($base_url . '/widget-loader.js');
+        $widget_key_attr   = esc_attr($inbox_key);
+        $inbox_key_js      = wp_json_encode($inbox_key);
+        $base_url_js       = wp_json_encode($base_url);
+        $cart_js           = wp_json_encode(['items' => $cart_items, 'total' => $cart_total]);
 
-        $inbox_key_js = wp_json_encode($inbox_key);
-        $base_url_js  = wp_json_encode($base_url);
-        $cart_js      = wp_json_encode(['items' => $cart_items, 'total' => $cart_total]);
-
-        $inline = <<<JS
-(function () {
-  var inboxKey = {$inbox_key_js};
-  var base     = {$base_url_js};
-  var cart     = {$cart_js};
-
-  // ── Inject widget loader ──────────────────────────────────────────────────
-  var s = document.createElement('script');
-  s.src   = base + '/widget-loader.js?key=' + encodeURIComponent(inboxKey);
-  s.defer = true;
-  document.body.appendChild(s);
+        add_action('wp_footer', static function () use ($widget_loader_url, $widget_key_attr, $inbox_key_js, $base_url_js, $cart_js): void {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
+            // Output a real <script src> tag — not via wp_register_script (dummy handle) because
+            // caching plugins intercept that pattern and delay/strip it.
+            // data-widget-key survives WP Rocket minification (unlike ?key= URL params).
+            echo "\n" . '<script src="' . $widget_loader_url . '" data-widget-key="' . $widget_key_attr . '" async></script>' . "\n";
+            echo '<script>' . "\n";
+            echo '(function () {' . "\n";
+            echo '  var inboxKey = ' . $inbox_key_js . ';' . "\n";
+            echo '  var base     = ' . $base_url_js . ';' . "\n";
+            echo '  var cart     = ' . $cart_js . ';' . "\n";
+            echo <<<'JS'
 
   // ── Cart tracking helper ──────────────────────────────────────────────────
   function sendCartUpdate(cartData) {
     var fp = '';
     try { fp = localStorage.getItem('nmrc_fp') || ''; } catch (e) {}
     if (!fp) {
-      // Fingerprint not yet set — retry once after widget has initialised
       setTimeout(function () { sendCartUpdate(cartData); }, 1500);
       return;
     }
@@ -324,22 +423,21 @@ class Neura_WooCommerce_Sync {
     }).catch(function () {});
   }
 
-  // ── Send initial cart state after widget loads ────────────────────────────
-  s.addEventListener('load', function () {
+  // ── Send initial cart state after widget script loads ────────────────────
+  // Use window event since WP Rocket may delay script loading until after DOMContentLoaded.
+  window.addEventListener('load', function () {
     if (cart.items.length > 0 || cart.total > 0) {
       setTimeout(function () { sendCartUpdate(cart); }, 1200);
     }
   });
 
   // ── Listen for live WooCommerce cart events ───────────────────────────────
-  // WooCommerce fires these jQuery events on document.body
   document.addEventListener('DOMContentLoaded', function () {
     if (typeof jQuery === 'undefined') return;
 
     jQuery(document.body).on(
       'added_to_cart removed_from_cart updated_cart_totals wc_fragments_refreshed',
       function () {
-        // Fetch fresh cart from WooCommerce AJAX endpoint
         var ajaxUrl = (typeof wc_cart_fragments_params !== 'undefined')
           ? wc_cart_fragments_params.wc_ajax_url
           : (typeof woocommerce_params !== 'undefined' ? woocommerce_params.ajax_url : '/');
@@ -351,15 +449,12 @@ class Neura_WooCommerce_Sync {
           {},
           function (data) {
             if (data && data.cart_hash !== undefined) {
-              // Re-fetch cart totals via a separate lightweight endpoint
               fetch(base + '/api/v1/inbox/widget-cart?inboxKey=' + encodeURIComponent(inboxKey), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                // Pass WC session cookie automatically (same origin if widget is on same domain)
               }).then(function (r) { return r.ok ? r.json() : null; })
                 .then(function (d) { if (d && d.cart) sendCartUpdate(d.cart); })
                 .catch(function () {
-                  // Fallback: send total from page if available
                   var totalEl = document.querySelector('.cart-subtotal .woocommerce-Price-amount');
                   var totalText = totalEl ? totalEl.textContent.replace(/[^0-9,.]/g, '').replace(',', '.') : '0';
                   sendCartUpdate({ items: [], total: parseFloat(totalText) || 0 });
@@ -370,9 +465,7 @@ class Neura_WooCommerce_Sync {
       }
     );
 
-    // Also track on add-to-cart button click (fires before AJAX completes)
     jQuery(document.body).on('click', '.add_to_cart_button, .single_add_to_cart_button', function () {
-      // Brief delay so WooCommerce AJAX has finished
       setTimeout(function () {
         var totalEl = document.querySelector('.cart-subtotal .woocommerce-Price-amount, .order-total .woocommerce-Price-amount');
         if (totalEl) {
@@ -384,16 +477,109 @@ class Neura_WooCommerce_Sync {
   });
 })();
 JS;
+            echo '</script>' . "\n";
+            // phpcs:enable
+        }, 100);
+    }
 
-        wp_add_inline_script('nwws-chat', $inline);
+    /**
+     * Excludes the Neuramerce widget script from WP Rocket optimizations.
+     * Called by rocket_exclude_js, rocket_delay_js_exclusions, rocket_minify_excluded_src filters.
+     *
+     * @param array<string> $exclusions
+     * @return array<string>
+     */
+    public function rocket_exclude_widget(array $exclusions): array {
+        // Exclude the Neuramerce widget-loader from WP Rocket delay/minification.
+        // Pattern matches both the external URL and the locally cached minified copy.
+        $exclusions[] = 'widget-loader';
+        return $exclusions;
+    }
+
+    /**
+     * Injecteert track.js voor conversie-tracking en multi-touch attributie.
+     * Activeert alleen als nwws_tracking_token is ingevuld.
+     */
+    public function enqueue_tracking_script(): void {
+        $token = sanitize_text_field(get_option('nwws_tracking_token', ''));
+        if (empty($token)) return;
+
+        $raw_url  = get_option('nwws_api_url', '');
+        $base_url = $raw_url
+            ? rtrim(preg_replace('#/api/.*$#', '', $raw_url), '/')
+            : 'https://app.neuramerce.com';
+
+        $inbox_key = sanitize_text_field(get_option('nwws_chat_inbox_key', ''));
+
+        $token_js     = wp_json_encode($token);
+        $base_url_js  = wp_json_encode($base_url);
+        $inbox_key_js = wp_json_encode($inbox_key);
+
+        // Inline script VÓÓR track.js zodat de variabelen beschikbaar zijn
+        $before_inline = <<<JS
+var NMRC_TOKEN = {$token_js};
+window.NauraTrack = window.NauraTrack || {};
+window.NauraTrack.key  = {$inbox_key_js};
+window.NauraTrack.base = {$base_url_js};
+JS;
+
+        wp_register_script(
+            'neuramerce-track',
+            $base_url . '/track.js',
+            [],
+            NWWS_VERSION,
+            false // in <head> — fingerprint zo vroeg mogelijk beschikbaar
+        );
+        wp_enqueue_script('neuramerce-track');
+        wp_add_inline_script('neuramerce-track', $before_inline, 'before');
+    }
+
+    /**
+     * Vuurt het purchase event op de WooCommerce bedankt-pagina.
+     * Koppelt de aankoop aan de bezoekers-fingerprint voor multi-touch attributie.
+     *
+     * @param int $order_id WooCommerce order ID
+     */
+    public function fire_purchase_event(int $order_id): void {
+        $token = sanitize_text_field(get_option('nwws_tracking_token', ''));
+        if (empty($token)) return;
+
+        $order    = wc_get_order($order_id);
+        if (!$order) return;
+
+        $order_id_js = wp_json_encode((string) $order_id);
+        $value_js    = wp_json_encode((float) $order->get_total());
+        $currency_js = wp_json_encode($order->get_currency());
+
+        // Wacht tot track.js geladen is, dan stuur purchase event
+        echo "<script>
+(function waitForTrack() {
+  if (window.NauraTrack && window.NauraTrack.purchase) {
+    window.NauraTrack.purchase({$order_id_js}, {$value_js}, {$currency_js});
+  } else {
+    setTimeout(waitForTrack, 200);
+  }
+})();
+</script>\n";
     }
 
     public function render_settings_page(): void {
         if (isset($_POST['nwws_save_settings'])) {
             check_admin_referer('nwws_settings');
 
-            update_option('nwws_api_url',                  sanitize_text_field($_POST['nwws_api_url']));
-            update_option('nwws_api_key',                  sanitize_text_field($_POST['nwws_api_key']));
+            $prev_api_key = get_option('nwws_api_key', '');
+            $prev_conn_id = get_option('nwws_connection_id', '');
+            $new_api_url  = sanitize_text_field($_POST['nwws_api_url'] ?? 'https://app.neuramerce.com/api');
+            $new_api_key  = sanitize_text_field($_POST['nwws_api_key'] ?? '');
+            $new_conn_id  = sanitize_text_field($_POST['nwws_connection_id'] ?? '');
+            update_option('nwws_api_url',       $new_api_url ?: 'https://app.neuramerce.com/api');
+            update_option('nwws_api_key',       $new_api_key);
+            update_option('nwws_connection_id', $new_conn_id);
+
+            // Reset transient wanneer credentials gewijzigd zijn — voorkomt stale cache van vorig account
+            if ($new_api_key !== $prev_api_key || $new_conn_id !== $prev_conn_id) {
+                delete_transient('nwws_config_synced');
+            }
             $saved_push_url = esc_url_raw($_POST['nwws_push_url'] ?? '');
             update_option('nwws_push_url', $saved_push_url);
             update_option('nwws_push_key', sanitize_text_field($_POST['nwws_push_key'] ?? ''));
@@ -402,24 +588,59 @@ JS;
             parse_str(parse_url($saved_push_url, PHP_URL_QUERY) ?? '', $parsed_qs);
             $extracted_ws = sanitize_text_field($parsed_qs['workspace'] ?? $_POST['nwws_workspace_id'] ?? '');
             if (!empty($extracted_ws)) update_option('nwws_workspace_id', $extracted_ws);
-            update_option('nwws_sync_enabled',             isset($_POST['nwws_sync_enabled'])             ? '1' : '0');
-            update_option('nwws_sync_products',            isset($_POST['nwws_sync_products'])            ? '1' : '0');
-            update_option('nwws_sync_orders',              isset($_POST['nwws_sync_orders'])              ? '1' : '0');
-            update_option('nwws_sync_customers',           isset($_POST['nwws_sync_customers'])           ? '1' : '0');
-            update_option('nwws_track_conversions',        isset($_POST['nwws_track_conversions'])        ? '1' : '0');
-            update_option('nwws_sync_fields_prices',       isset($_POST['nwws_sync_fields_prices'])       ? '1' : '0');
-            update_option('nwws_sync_fields_cogs',         isset($_POST['nwws_sync_fields_cogs'])         ? '1' : '0');
-            update_option('nwws_sync_fields_stock',        isset($_POST['nwws_sync_fields_stock'])        ? '1' : '0');
-            update_option('nwws_sync_fields_ean',          isset($_POST['nwws_sync_fields_ean'])          ? '1' : '0');
-            update_option('nwws_sync_fields_categories',   isset($_POST['nwws_sync_fields_categories'])   ? '1' : '0');
-            $selected_attrs = isset($_POST['nwws_sync_attr']) && is_array($_POST['nwws_sync_attr'])
-                ? implode(',', array_map('sanitize_key', $_POST['nwws_sync_attr']))
+            update_option('nwws_sync_enabled',             !empty($_POST['nwws_sync_enabled'])             ? '1' : '0');
+            update_option('nwws_sync_products',            !empty($_POST['nwws_sync_products'])            ? '1' : '0');
+            update_option('nwws_sync_orders',              !empty($_POST['nwws_sync_orders'])              ? '1' : '0');
+            update_option('nwws_sync_customers',           !empty($_POST['nwws_sync_customers'])           ? '1' : '0');
+            update_option('nwws_track_conversions',        !empty($_POST['nwws_track_conversions'])        ? '1' : '0');
+            update_option('nwws_sync_fields_prices',       !empty($_POST['nwws_sync_fields_prices'])       ? '1' : '0');
+            update_option('nwws_sync_fields_cogs',         !empty($_POST['nwws_sync_fields_cogs'])         ? '1' : '0');
+            update_option('nwws_sync_fields_stock',        !empty($_POST['nwws_sync_fields_stock'])        ? '1' : '0');
+            update_option('nwws_sync_fields_ean',          !empty($_POST['nwws_sync_fields_ean'])          ? '1' : '0');
+            update_option('nwws_sync_fields_categories',   !empty($_POST['nwws_sync_fields_categories'])   ? '1' : '0');
+            $raw_attrs = $_POST['nwws_sync_attr'] ?? [];
+            $selected_attrs = is_array($raw_attrs)
+                ? implode(',', array_map('sanitize_key', $raw_attrs))
                 : '';
             update_option('nwws_sync_attrs', $selected_attrs);
 
             // Chat widget
-            update_option('nwws_chat_enabled',   isset($_POST['nwws_chat_enabled'])   ? '1' : '0');
+            update_option('nwws_chat_enabled',   !empty($_POST['nwws_chat_enabled'])   ? '1' : '0');
             update_option('nwws_chat_inbox_key', sanitize_text_field($_POST['nwws_chat_inbox_key'] ?? ''));
+
+            // Attribution tracking
+            update_option('nwws_tracking_token', sanitize_text_field($_POST['nwws_tracking_token'] ?? ''));
+
+            // AI Chat Data
+            update_option('nwws_ai_expose_order_status',  !empty($_POST['nwws_ai_expose_order_status'])  ? '1' : '0');
+            update_option('nwws_ai_expose_customer_data', !empty($_POST['nwws_ai_expose_customer_data']) ? '1' : '0');
+            update_option('nwws_ai_expose_cart_contents', !empty($_POST['nwws_ai_expose_cart_contents']) ? '1' : '0');
+
+            // Auto-fetch workspace config als inbox key nog leeg is na opslaan POST-data
+            // (auto-fetch pas hier zodat POST-waarden niet overschreven worden door de fetch)
+            $current_inbox_key = get_option('nwws_chat_inbox_key', '');
+            if (!empty($new_api_key) && !empty($new_conn_id) && empty($current_inbox_key)) {
+                $config_url = rtrim($new_api_url ?: 'https://app.neuramerce.com/api', '/') . '/woocommerce/workspace-config';
+                $config_res = wp_remote_get(add_query_arg('connectionId', rawurlencode($new_conn_id), $config_url), [
+                    'headers' => ['X-Neuramerce-Plugin-Key' => $new_api_key],
+                    'timeout' => 10,
+                ]);
+                $notice_type = 'warning';
+                $notice_msg  = '&#9888; Instellingen opgeslagen, maar verbinding met Neuramerce kon niet worden geverifieerd — controleer API Key en Connection ID.';
+                if (!is_wp_error($config_res) && wp_remote_retrieve_response_code($config_res) === 200) {
+                    $config        = json_decode(wp_remote_retrieve_body($config_res), true);
+                    $fetched_inbox = !empty($config['inboxKey']);
+                    $fetched_token = !empty($config['trackingToken']);
+                    if ($fetched_inbox) update_option('nwws_chat_inbox_key', sanitize_text_field($config['inboxKey']));
+                    if ($fetched_token) update_option('nwws_tracking_token',  sanitize_text_field($config['trackingToken']));
+                    set_transient('nwws_config_synced', '1', HOUR_IN_SECONDS);
+                    $notice_type = 'success';
+                    $notice_msg  = $fetched_inbox
+                        ? '&#10003; Verbinding geverifieerd &amp; chat widget automatisch geconfigureerd.'
+                        : '&#10003; Verbinding met Neuramerce geverifieerd. Chat widget wordt geconfigureerd zodra je inbox beschikbaar is — <a href="' . esc_url(admin_url('admin.php?page=neura-wp-woo-sync&tab=connect')) . '">vernieuw deze pagina</a>.';
+                }
+                echo '<div class="notice notice-' . esc_attr($notice_type) . '"><p>' . wp_kses($notice_msg, ['a' => ['href' => []]]) . '</p></div>';
+            }
 
             echo '<div class="notice notice-success"><p>Instellingen opgeslagen!</p></div>';
         }
@@ -435,22 +656,190 @@ JS;
                 echo '<div class="notice notice-warning"><p>API key ingetrokken.</p></div>';
             }
         }
-                $active_tab = isset($_GET['tab']) ? sanitize_key($_GET['tab']) : 'sync';
+
+        if (isset($_POST['nwws_clear_log'])) {
+            check_admin_referer('nwws_clear_log');
+            update_option('nwws_sync_log', '[]');
+            echo '<div class="notice notice-success"><p>Synchronisatie-log gewist.</p></div>';
+        }
+
+        // Force refresh via URL param (wist transient + status zodat opnieuw wordt opgehaald)
+        if (!empty($_GET['nwws_force_refresh']) && current_user_can('manage_options')) {
+            delete_transient('nwws_config_synced');
+            delete_option('nwws_config_fetch_status');
+        }
+
+        // Auto-fetch inbox key + tracking token als die nog leeg zijn maar API credentials bekend zijn
+        $this->maybe_auto_fetch_workspace_config();
+
+        $active_tab = sanitize_key($_GET['tab'] ?? 'connect');
         $page_url   = admin_url('admin.php?page=neura-wp-woo-sync');
+        $wc_active  = class_exists('WooCommerce');
+        $connected  = !empty(get_option('nwws_api_url')) && !empty(get_option('nwws_api_key'));
+        $conn_badge = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-left:5px;vertical-align:middle;background:' . ($connected ? '#46b450' : '#dc3232') . ';" title="' . ($connected ? 'Verbonden' : 'Niet verbonden') . '"></span>';
         ?>
         <nav class="nav-tab-wrapper" style="margin-bottom:1.5rem">
-            <a href="<?php echo esc_url($page_url . '&tab=sync'); ?>" class="nav-tab <?php echo $active_tab === 'sync' ? 'nav-tab-active' : ''; ?>">Instellingen</a>
-            <a href="<?php echo esc_url($page_url . '&tab=migrate'); ?>" class="nav-tab <?php echo $active_tab === 'migrate' ? 'nav-tab-active' : ''; ?>">Migratie</a>
+            <a href="<?php echo esc_url($page_url . '&tab=connect'); ?>"
+               class="nav-tab <?php echo $active_tab === 'connect' ? 'nav-tab-active' : ''; ?>">
+                Neura Connect
+            </a>
+            <a href="<?php echo esc_url($page_url . '&tab=woocommerce'); ?>"
+               class="nav-tab <?php echo $active_tab === 'woocommerce' ? 'nav-tab-active' : ''; ?>">
+                WordPress &amp; WooCommerce<?php echo $conn_badge; ?>
+            </a>
+            <a href="<?php echo esc_url($page_url . '&tab=migrate'); ?>"
+               class="nav-tab <?php echo $active_tab === 'migrate' ? 'nav-tab-active' : ''; ?>">
+                Migratie
+            </a>
+            <a href="<?php echo esc_url($page_url . '&tab=logs'); ?>"
+               class="nav-tab <?php echo $active_tab === 'logs' ? 'nav-tab-active' : ''; ?>">
+                Logs
+            </a>
         </nav>
         <?php
-        if ($active_tab === 'sync') {
-            include NWWS_PLUGIN_DIR . 'templates/settings-page.php';
-        } else {
+        if ($active_tab === 'woocommerce') {
+            include NWWS_PLUGIN_DIR . 'templates/tab-woocommerce.php';
+        } elseif ($active_tab === 'migrate') {
             include NWWS_PLUGIN_DIR . 'templates/migration-tab.php';
+        } elseif ($active_tab === 'logs') {
+            include NWWS_PLUGIN_DIR . 'templates/tab-logs.php';
+        } else {
+            include NWWS_PLUGIN_DIR . 'templates/tab-connect.php';
         }
     }
 
     // =========================================================================
+    // SETUP REDIRECT — admin_init (vóór headers verstuurd)
+    // =========================================================================
+
+    /**
+     * Verwerkt de auto-configure URL params die Neuramerce meestuurt bij het openen van WP admin.
+     * Aangeroepen via admin_init hook — op dat moment zijn HTTP-headers nog NIET verstuurd,
+     * dus wp_safe_redirect() + exit werkt hier correct.
+     * render_admin_page() wordt te laat aangeroepen (headers al weg) voor een redirect.
+     */
+    public function handle_setup_redirect(): void {
+        if (!is_admin()) return;
+        if (($_GET['page'] ?? '') !== 'neura-wp-woo-sync') return;
+        if (empty($_GET['nwws_setup'])) return;
+        if (!current_user_can('manage_options')) return;
+
+        $new_api_key = sanitize_text_field(wp_unslash($_GET['nwws_api_key'] ?? ''));
+        $new_conn_id = sanitize_text_field(wp_unslash($_GET['nwws_conn_id'] ?? ''));
+        if (empty($new_api_key) || empty($new_conn_id)) return;
+
+        update_option('nwws_api_url',       'https://app.neuramerce.com/api');
+        update_option('nwws_api_key',       $new_api_key);
+        update_option('nwws_connection_id', $new_conn_id);
+        delete_transient('nwws_config_synced');
+        delete_option('nwws_config_fetch_status');
+
+        // Haal direct workspace config op (inbox key + tracking token + auto-enables chat widget)
+        $this->do_fetch_workspace_config($new_api_key, $new_conn_id);
+
+        // Sla success flag op in transient zodat het template een inline notice kan tonen
+        set_transient('nwws_just_configured', '1', 60);
+
+        wp_safe_redirect(admin_url('admin.php?page=neura-wp-woo-sync&tab=connect'));
+        exit;
+    }
+
+    // =========================================================================
+    // AUTO-FETCH WORKSPACE CONFIG
+    // =========================================================================
+
+    /**
+     * Haalt inbox key + tracking token op van Neuramerce als die nog leeg zijn.
+     * Wordt aangeroepen bij het laden van de settings pagina.
+     * Slaat altijd het resultaat op in nwws_config_fetch_status zodat het template
+     * een passende boodschap kan tonen (ok_configured, ok_no_inbox, error_401, etc.).
+     * Gebruikt een transient zodat het niet bij elke pageload een HTTP request doet.
+     */
+    private function maybe_auto_fetch_workspace_config(): void {
+        $api_key = get_option('nwws_api_key', '');
+        $conn_id = get_option('nwws_connection_id', '');
+        if (empty($api_key) || empty($conn_id)) return;
+
+        // Transient check altijd vooraan — ongeacht of inbox key leeg is of niet.
+        // Zonder dit maakt de plugin bij elke pageload een HTTP request als inbox key leeg is.
+        if (get_transient('nwws_config_synced')) return;
+
+        $this->do_fetch_workspace_config($api_key, $conn_id);
+    }
+
+    /**
+     * Voert de daadwerkelijke API call uit en slaat het resultaat op.
+     * Aanroepbaar vanuit zowel de auto-fetch als de AJAX test handler.
+     */
+    private function do_fetch_workspace_config(string $api_key, string $conn_id): string {
+        $api_url    = get_option('nwws_api_url', 'https://app.neuramerce.com/api');
+        $config_url = rtrim($api_url, '/') . '/woocommerce/workspace-config';
+        $response   = wp_remote_get(
+            add_query_arg('connectionId', rawurlencode($conn_id), $config_url),
+            ['headers' => ['X-Neuramerce-Plugin-Key' => $api_key], 'timeout' => 8, 'sslverify' => true]
+        );
+
+        if (is_wp_error($response)) {
+            update_option('nwws_config_fetch_status', 'error_network');
+            set_transient('nwws_config_synced', '1', 2 * MINUTE_IN_SECONDS);
+            return 'error_network';
+        }
+
+        $code = (int) wp_remote_retrieve_response_code($response);
+
+        if ($code === 401) {
+            update_option('nwws_config_fetch_status', 'error_401');
+            set_transient('nwws_config_synced', '1', 5 * MINUTE_IN_SECONDS);
+            return 'error_401';
+        }
+
+        if ($code === 404) {
+            // Verbinding bestaat niet meer op Neuramerce — verwijder gecachte credentials automatisch.
+            // De plugin toont daarna een "opnieuw koppelen" notice i.p.v. een onoplosbare fout.
+            $this->clear_connection_options();
+            update_option('nwws_config_fetch_status', 'error_404');
+            set_transient('nwws_config_synced', '1', 5 * MINUTE_IN_SECONDS);
+            return 'error_404';
+        }
+
+        if ($code !== 200) {
+            $status = 'error_' . $code;
+            update_option('nwws_config_fetch_status', $status);
+            set_transient('nwws_config_synced', '1', 5 * MINUTE_IN_SECONDS);
+            return $status;
+        }
+
+        $config         = json_decode(wp_remote_retrieve_body($response), true);
+        $inbox_key      = !empty($config['inboxKey'])      ? sanitize_text_field($config['inboxKey'])      : null;
+        $tracking_token = !empty($config['trackingToken']) ? sanitize_text_field($config['trackingToken']) : null;
+
+        if ($inbox_key) {
+            update_option('nwws_chat_inbox_key', $inbox_key);
+            update_option('nwws_chat_enabled', '1'); // auto-enable widget zodra inbox key beschikbaar is
+        }
+        if ($tracking_token) update_option('nwws_tracking_token', $tracking_token);
+
+        $status = ($inbox_key !== null) ? 'ok_configured' : 'ok_no_inbox';
+        update_option('nwws_config_fetch_status', $status);
+        set_transient('nwws_config_synced', '1', HOUR_IN_SECONDS);
+        return $status;
+    }
+
+    /**
+     * Wist alle verbindingsgegevens uit WordPress opties en transients.
+     * Aanroepbaar vanuit AJAX disconnect en automatisch bij 404-respons.
+     */
+    private function clear_connection_options(): void {
+        delete_option('nwws_api_key');
+        delete_option('nwws_connection_id');
+        delete_option('nwws_api_url');
+        delete_option('nwws_chat_inbox_key');
+        delete_option('nwws_tracking_token');
+        delete_option('nwws_chat_enabled');
+        delete_option('nwws_config_fetch_status');
+        delete_transient('nwws_config_synced');
+    }
+
     // COGS (Cost of Goods Sold) FIELDS
     // =========================================================================
 
@@ -700,6 +1089,289 @@ JS;
     }
 
     // =========================================================================
+    // CUSTOM ORDER STATUS — "Naar warehouse"
+    // =========================================================================
+
+    /**
+     * Registreer de custom order-status `wc-naar-warehouse`.
+     *
+     * Doel: zodra Neuramerce een order naar GP/Warehouse Online doorstuurt
+     * verandert de Woo-status naar deze custom status. Daarmee blijft
+     * 'processing' (Verwerken) gereserveerd voor orders die nog handmatig
+     * opgepakt moeten worden — en is in één oogopslag duidelijk welke orders
+     * al in fulfillment-flow zitten.
+     */
+    public function register_naar_warehouse_status(): void {
+        register_post_status('wc-naar-warehouse', [
+            'label'                     => _x('Naar warehouse', 'Order status', 'neura-wp-woo-sync'),
+            'public'                    => true,
+            'exclude_from_search'       => false,
+            'show_in_admin_all_list'    => true,
+            'show_in_admin_status_list' => true,
+            // translators: %s: aantal orders met deze status
+            'label_count'               => _n_noop(
+                'Naar warehouse <span class="count">(%s)</span>',
+                'Naar warehouse <span class="count">(%s)</span>',
+                'neura-wp-woo-sync'
+            ),
+        ]);
+    }
+
+    /**
+     * Voeg toe aan de WC orderstatus-dropdown (admin én rapporten).
+     * Volgorde: na 'processing' zodat ze visueel naast elkaar staan.
+     */
+    public function add_naar_warehouse_to_order_statuses(array $statuses): array {
+        $new_statuses = [];
+        foreach ($statuses as $key => $label) {
+            $new_statuses[$key] = $label;
+            if ('wc-processing' === $key) {
+                $new_statuses['wc-naar-warehouse'] = _x('Naar warehouse', 'Order status', 'neura-wp-woo-sync');
+            }
+        }
+        return $new_statuses;
+    }
+
+    /** Markeer als 'paid' status zodat WC stock-decrement, refund-flow etc. correct werken. */
+    public function mark_naar_warehouse_as_paid(array $statuses): array {
+        $statuses[] = 'naar-warehouse';
+        return $statuses;
+    }
+
+    /** Includer in WC reports (omzet/aantal verkopen). */
+    public function mark_naar_warehouse_for_reports(array $statuses): array {
+        $statuses[] = 'naar-warehouse';
+        return $statuses;
+    }
+
+    /** Sta toe dat een order in deze status nog payment_complete krijgt (refund/herzending). */
+    public function mark_naar_warehouse_payment_complete(array $statuses): array {
+        $statuses[] = 'naar-warehouse';
+        return $statuses;
+    }
+
+    // =========================================================================
+    // MULTI-SHIPMENT STATUS (v1.11.0) — partially_shipped voor split-orders
+    // =========================================================================
+    //
+    // Doel: order met regels naar verschillende warehouses (Eindhoven via GP +
+    // Venlo via Warehouse Online) toont 'wc-partially-shipped' zodra eerste
+    // shipment binnen is, en pas 'completed' wanneer alle shipments klaar zijn.
+    // Neura's Postgres-trigger op order_shipments hercomputeert dit automatisch
+    // en pusht via plugin-endpoint /orders/{id}/status.
+
+    /**
+     * Registreer custom order-status `wc-partially-shipped`.
+     */
+    public function register_partially_shipped_status(): void {
+        register_post_status('wc-partially-shipped', [
+            'label'                     => _x('Gedeeltelijk verzonden', 'Order status', 'neura-wp-woo-sync'),
+            'public'                    => true,
+            'exclude_from_search'       => false,
+            'show_in_admin_all_list'    => true,
+            'show_in_admin_status_list' => true,
+            // translators: %s: aantal orders met deze status
+            'label_count'               => _n_noop(
+                'Gedeeltelijk verzonden <span class="count">(%s)</span>',
+                'Gedeeltelijk verzonden <span class="count">(%s)</span>',
+                'neura-wp-woo-sync'
+            ),
+        ]);
+    }
+
+    /** Voeg toe aan de WC orderstatus-dropdown direct vóór 'completed'. */
+    public function add_partially_shipped_to_order_statuses(array $statuses): array {
+        $new_statuses = [];
+        foreach ($statuses as $key => $label) {
+            if ('wc-completed' === $key) {
+                $new_statuses['wc-partially-shipped'] = _x('Gedeeltelijk verzonden', 'Order status', 'neura-wp-woo-sync');
+            }
+            $new_statuses[$key] = $label;
+        }
+        return $new_statuses;
+    }
+
+    /** Markeer als 'paid' status — geld is binnen, alleen levering loopt nog. */
+    public function mark_partially_shipped_as_paid(array $statuses): array {
+        $statuses[] = 'partially-shipped';
+        return $statuses;
+    }
+
+    /** Includer in WC reports (omzet/aantal verkopen). */
+    public function mark_partially_shipped_for_reports(array $statuses): array {
+        $statuses[] = 'partially-shipped';
+        return $statuses;
+    }
+
+    /**
+     * Sta toe dat order in deze status nog payment_complete krijgt.
+     *
+     * Scenario: handmatig-betaalde gateway (bank-transfer) → order in
+     * 'pending' → admin pakt 'm op → split naar 2 warehouses → eerste
+     * shipment komt aan → status springt naar 'partially-shipped' zonder
+     * ooit door 'processing' te zijn gegaan. Zonder deze filter wordt
+     * payment_complete() nooit getriggerd → stock-decrement, downloadable
+     * products en transactional emails missen.
+     */
+    public function mark_partially_shipped_payment_complete(array $statuses): array {
+        $statuses[] = 'partially-shipped';
+        return $statuses;
+    }
+
+    /**
+     * HPOS-compatibele registratie: WC 8.x leest order-status uit het
+     * dedicated `wc_orders.status`-veld via deze filter, niet via WP's
+     * post_status-registry. Zonder deze filter valt 'wc-partially-shipped'
+     * uit de admin-dropdown op shops met custom_orders_table_usage_is_enabled().
+     *
+     * Filter komt parallel met register_post_status — dubbele registratie is
+     * idempotent want WC merge't ze.
+     */
+    public function add_partially_shipped_to_post_statuses(array $statuses): array {
+        $statuses['wc-partially-shipped'] = [
+            'label'                     => _x('Gedeeltelijk verzonden', 'Order status', 'neura-wp-woo-sync'),
+            'public'                    => true,
+            'exclude_from_search'       => false,
+            'show_in_admin_all_list'    => true,
+            'show_in_admin_status_list' => true,
+            'label_count'               => _n_noop(
+                'Gedeeltelijk verzonden <span class="count">(%s)</span>',
+                'Gedeeltelijk verzonden <span class="count">(%s)</span>',
+                'neura-wp-woo-sync'
+            ),
+        ];
+        return $statuses;
+    }
+
+    // =========================================================================
+    // EMAIL-SUPPRESSION (v1.11.0) — A1+A2 dubbele-mail-fix
+    // =========================================================================
+
+    /**
+     * Onderdruk WC-default klant-mail wanneer Neura via z'n inbox-template-
+     * engine al een mail stuurt voor deze status. Voorkomt dubbele mails bij
+     * snooze (Neura snooze-mail) en partially_shipped (Neura split-shipment-mail).
+     *
+     * Filter-API: WooCommerce roept woocommerce_email_enabled_customer_<status>_order
+     * aan vóór het verzenden. Returnt false → mail wordt niet verstuurd.
+     *
+     * @param bool   $enabled Standaard-state (true = mail wordt gestuurd)
+     * @param object $order   WC_Order
+     * @return bool
+     */
+    public function maybe_suppress_default_email($enabled, $order, $email = null): bool {
+        if (!$enabled) return false;
+        if (!is_object($order) || !method_exists($order, 'get_status')) return $enabled;
+
+        $status = $order->get_status();
+        // Custom statussen waar Neura zelf de mail-flow regelt:
+        $neura_handled_statuses = [
+            'gesnoozed',          // snooze-mail via inbox-template
+            'partially-shipped',  // split-shipment-mail via inbox-template
+        ];
+
+        // Allow filter — site-eigenaar kan extra statussen toevoegen via
+        // wp-config.php of mu-plugin als ze aanvullende mails via Neura sturen.
+        $neura_handled_statuses = apply_filters('nwws_neura_handled_email_statuses', $neura_handled_statuses);
+
+        if (in_array($status, $neura_handled_statuses, true)) {
+            return false;
+        }
+        return $enabled;
+    }
+
+    // =========================================================================
+    // CUSTOM ORDER STATUSSEN (v1.3.0) — door Neura aangeleverd via /order-statuses
+    // =========================================================================
+
+    /**
+     * Lees lijst custom statussen uit WP option (gepushed door Neura via REST).
+     * Returnt array met sanitized rijen — elke rij heeft tenminste 'key' en 'label'.
+     */
+    private function nwws_get_custom_statuses(): array {
+        $raw = get_option('nwws_custom_order_statuses', []);
+        if (!is_array($raw)) return [];
+        return array_values(array_filter($raw, fn($s) => is_array($s) && !empty($s['key'])));
+    }
+
+    /**
+     * Registreer alle door Neura aangeleverde statussen als post_status.
+     * Draait op `init` priority 11 — ná register_naar_warehouse_status zodat dat
+     * gegarandeerd eerst klaar is en custom statussen daar nooit overheen schrijven.
+     */
+    public function nwws_register_custom_statuses(): void {
+        foreach ($this->nwws_get_custom_statuses() as $s) {
+            if (empty($s['is_active']) && isset($s['is_active'])) continue;
+            $key = sanitize_key((string) $s['key']);
+            register_post_status('wc-' . $key, [
+                'label'                     => sanitize_text_field((string) ($s['label'] ?? $key)),
+                'public'                    => true,
+                'exclude_from_search'       => false,
+                'show_in_admin_all_list'    => true,
+                'show_in_admin_status_list' => true,
+            ]);
+        }
+    }
+
+    /** Voeg de custom statussen toe aan de WC orderstatus-dropdown. */
+    public function nwws_add_custom_statuses_to_dropdown(array $statuses): array {
+        foreach ($this->nwws_get_custom_statuses() as $s) {
+            if (isset($s['is_active']) && empty($s['is_active'])) continue;
+            $key   = 'wc-' . sanitize_key((string) $s['key']);
+            $label = sanitize_text_field((string) ($s['label'] ?? $s['key']));
+            $statuses[$key] = $label;
+        }
+        return $statuses;
+    }
+
+    /** Markeer custom statussen die als 'betaald' tellen (uit Neura-config). */
+    public function nwws_mark_custom_paid(array $statuses): array {
+        foreach ($this->nwws_get_custom_statuses() as $s) {
+            if (!empty($s['counts_as_paid'])) {
+                $statuses[] = sanitize_key((string) $s['key']);
+            }
+        }
+        return $statuses;
+    }
+
+    /** Includer custom statussen in WC reports (omzet/aantal). */
+    public function nwws_include_custom_in_reports(array $statuses): array {
+        foreach ($this->nwws_get_custom_statuses() as $s) {
+            $statuses[] = sanitize_key((string) $s['key']);
+        }
+        return $statuses;
+    }
+
+    // =========================================================================
+    // VOORRAADSTATUS-TEKST (v1.3.0) — vervangt Woo Custom Stock Status Pro
+    // =========================================================================
+
+    /**
+     * Vervang de standaard WC-availability-tekst door de Neura-tekst.
+     * Volgorde: product-override > eerste matchende categorie > WC default.
+     * Beïnvloedt alleen de getoonde tekst, niet de instock/outofstock class.
+     */
+    public function nwws_filter_availability(array $availability, $product): array {
+        if (!is_object($product) || !method_exists($product, 'get_id')) return $availability;
+
+        $product_id = $product->get_id();
+        $text = (string) get_post_meta($product_id, '_nwws_stock_status_text', true);
+
+        if ($text === '') {
+            $cat_ids = method_exists($product, 'get_category_ids') ? (array) $product->get_category_ids() : [];
+            foreach ($cat_ids as $cat_id) {
+                $cat_text = (string) get_term_meta((int) $cat_id, '_nwws_stock_status_text', true);
+                if ($cat_text !== '') { $text = $cat_text; break; }
+            }
+        }
+
+        if ($text !== '') {
+            $availability['availability'] = esc_html($text);
+        }
+        return $availability;
+    }
+
+    // =========================================================================
     // ORDER SYNC
     // =========================================================================
 
@@ -761,7 +1433,7 @@ JS;
                 'total'        => $item->get_total(),
                 'cogs'         => $cogs,
                 'unit_cogs'    => $product ? (float)($product->get_meta('_cogs_price') ?: $product->get_meta('_purchase_price') ?: $cogs) : $cogs,
-                'variant_name' => $product ? implode(' / ', array_filter(array_map(function($attr) { return $attr->get_option(); }, $product->get_attributes()))) : null,
+                'variant_name' => $item->get_variation_id() ? implode(' / ', array_filter(array_values(wc_get_product_variation_attributes($item->get_variation_id())))) : null,
             ];
         }
 
@@ -824,6 +1496,16 @@ JS;
         $this->send_to_api('orders', $data, 'POST');
     }
 
+    /**
+     * WP-Cron callback voor nwws_track_conversion_bg.
+     * Haalt de order op en verstuurt het conversie-event naar Neuramerce.
+     */
+    public function run_track_conversion_bg(int $order_id): void {
+        $order = wc_get_order($order_id);
+        if (!$order) return;
+        $this->track_conversion($order);
+    }
+
     private function track_conversion(\WC_Order $order): void {
         $this->send_to_api('conversions', [
             'event_name'     => 'Purchase',
@@ -876,8 +1558,11 @@ JS;
             'sync_fields_brand'     => get_option('nwws_sync_fields_brand', '1') === '1',
             'sync_fields_color'     => get_option('nwws_sync_fields_color', '1') === '1',
             'sync_fields_size'      => get_option('nwws_sync_fields_size', '1') === '1',
-            'sync_fields_categories'=> get_option('nwws_sync_fields_categories', '1') === '1',
-            'version'               => NWWS_VERSION,
+            'sync_fields_categories'    => get_option('nwws_sync_fields_categories', '1') === '1',
+            'ai_expose_order_status'    => get_option('nwws_ai_expose_order_status',  '1') === '1',
+            'ai_expose_customer_data'   => get_option('nwws_ai_expose_customer_data', '1') === '1',
+            'ai_expose_cart_contents'   => get_option('nwws_ai_expose_cart_contents', '0') === '1',
+            'version'                   => NWWS_VERSION,
         ]);
     }
 
@@ -901,7 +1586,10 @@ JS;
             'sync_fields_brand'      => 'nwws_sync_fields_brand',
             'sync_fields_color'      => 'nwws_sync_fields_color',
             'sync_fields_size'       => 'nwws_sync_fields_size',
-            'sync_fields_categories' => 'nwws_sync_fields_categories',
+            'sync_fields_categories'  => 'nwws_sync_fields_categories',
+            'ai_expose_order_status'  => 'nwws_ai_expose_order_status',
+            'ai_expose_customer_data' => 'nwws_ai_expose_customer_data',
+            'ai_expose_cart_contents' => 'nwws_ai_expose_cart_contents',
         ];
 
         foreach ($map as $key => $option) {
@@ -922,6 +1610,9 @@ JS;
     }
 
     public function rest_get_products(\WP_REST_Request $request): \WP_REST_Response {
+        if (!class_exists('WooCommerce')) {
+            return new \WP_REST_Response(['error' => 'WooCommerce niet actief'], 400);
+        }
         $products = wc_get_products([
             'limit'  => $request->get_param('per_page') ?: 50,
             'page'   => $request->get_param('page') ?: 1,
@@ -947,6 +1638,9 @@ JS;
     }
 
     public function rest_get_orders(\WP_REST_Request $request): \WP_REST_Response {
+        if (!class_exists('WooCommerce')) {
+            return new \WP_REST_Response(['error' => 'WooCommerce niet actief'], 400);
+        }
         $orders = wc_get_orders([
             'limit' => $request->get_param('per_page') ?: 50,
             'page'  => $request->get_param('page') ?: 1,
@@ -970,6 +1664,9 @@ JS;
     }
 
     public function rest_get_stats(\WP_REST_Request $request): \WP_REST_Response {
+        if (!class_exists('WooCommerce')) {
+            return new \WP_REST_Response(['error' => 'WooCommerce niet actief'], 400);
+        }
         global $wpdb;
         if ($this->is_hpos_enabled()) {
             $total_revenue = $wpdb->get_var("SELECT SUM(total_amount) FROM {$wpdb->prefix}wc_orders WHERE status IN ('wc-completed','wc-processing') AND type = 'shop_order'");
@@ -988,37 +1685,147 @@ JS;
     // AJAX HANDLERS
     // =========================================================================
 
+    /**
+     * AJAX: verwijder alle Neuramerce verbindingsgegevens uit WordPress.
+     * Simuleert een "ontkoppelen" — de plugin is daarna klaar voor een nieuwe koppeling.
+     */
+    public function ajax_disconnect(): void {
+        check_ajax_referer('nwws_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Geen toegang.');
+            return;
+        }
+        $this->clear_connection_options();
+        wp_send_json_success('Ontkoppeld. Koppel de site opnieuw via Neuramerce → Instellingen → Koppelingen.');
+    }
+
     public function ajax_test_connection(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
 
-        $api_url = get_option('nwws_api_url', '');
         $api_key = get_option('nwws_api_key', '');
+        $conn_id = get_option('nwws_connection_id', '');
 
-        if (empty($api_url) || empty($api_key)) {
-            wp_send_json_error('API URL en API Key zijn vereist.');
+        if (empty($api_key) || empty($conn_id)) {
+            wp_send_json_error('API Key en Connection ID zijn beide vereist voor de verbindingstest.');
+            return;
         }
 
-        $response = wp_remote_post($api_url . '/test', [
-            'headers' => ['Content-Type' => 'application/json', 'X-API-Key' => $api_key],
-            'body'    => wp_json_encode(['test' => true]),
-            'timeout' => 15,
+        // Wis transient zodat we vers ophalen (niet geblokkeerd door cache)
+        delete_transient('nwws_config_synced');
+
+        $status = $this->do_fetch_workspace_config($api_key, $conn_id);
+
+        switch ($status) {
+            case 'ok_configured':
+                $inbox_key = get_option('nwws_chat_inbox_key', '');
+                wp_send_json_success('✓ Verbinding OK — chat widget geconfigureerd (inbox: ' . esc_html(substr($inbox_key, 0, 8)) . '…).');
+                break;
+            case 'ok_no_inbox':
+                wp_send_json_success('✓ API verbinding OK — maar geen Inbox Key beschikbaar. Activeer de Inbox module in Neuramerce (Inbox → Instellingen → Widget).');
+                break;
+            case 'error_401':
+                wp_send_json_error('Ongeldige API Key — kopieer de sleutel opnieuw via Neuramerce → Instellingen → Koppelingen → WordPress.');
+                break;
+            case 'error_404':
+                wp_send_json_error('Connection ID niet gevonden — voeg de site opnieuw toe via Neuramerce → Instellingen → Koppelingen.');
+                break;
+            case 'error_network':
+                wp_send_json_error('Kan Neuramerce niet bereiken — controleer je internetverbinding of probeer later opnieuw.');
+                break;
+            default:
+                wp_send_json_error('Verbinding mislukt (' . esc_html($status) . ') — probeer later opnieuw.');
+        }
+    }
+
+    /**
+     * AJAX: voer een ruwe diagnostische HTTP call uit naar de workspace-config endpoint.
+     * Geeft de exacte URL, headers, HTTP status code en response body terug.
+     * Alleen toegankelijk voor beheerders.
+     */
+    public function ajax_diagnostics(): void {
+        check_ajax_referer('nwws_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Geen toegang.');
+            return;
+        }
+
+        $api_key = get_option('nwws_api_key', '');
+        $conn_id = get_option('nwws_connection_id', '');
+        $api_url = get_option('nwws_api_url', 'https://app.neuramerce.com/api');
+        $inbox   = get_option('nwws_chat_inbox_key', '');
+        $token   = get_option('nwws_tracking_token', '');
+        $status  = get_option('nwws_config_fetch_status', '(niet opgeslagen)');
+        $transient_active = (bool) get_transient('nwws_config_synced');
+
+        // Wis transient zodat we een verse call doen
+        delete_transient('nwws_config_synced');
+
+        $config_url = rtrim($api_url, '/') . '/woocommerce/workspace-config';
+        $request_url = add_query_arg('connectionId', rawurlencode($conn_id), $config_url);
+
+        $response = wp_remote_get($request_url, [
+            'headers'   => ['X-Neuramerce-Plugin-Key' => $api_key],
+            'timeout'   => 10,
+            'sslverify' => true,
         ]);
 
+        $report = [
+            'stored' => [
+                'api_url'      => $api_url,
+                'api_key'      => $api_key ? (substr($api_key, 0, 8) . '…(' . strlen($api_key) . ' chars)') : '(leeg)',
+                'conn_id'      => $conn_id ?: '(leeg)',
+                'inbox_key'    => $inbox   ? (substr($inbox, 0, 8) . '…') : '(leeg)',
+                'tracking'     => $token   ? (substr($token, 0, 8) . '…') : '(leeg)',
+                'fetch_status' => $status,
+                'transient_was_active' => $transient_active,
+            ],
+            'request' => [
+                'url'    => $request_url,
+                'method' => 'GET',
+                'header' => 'X-Neuramerce-Plugin-Key: ' . (substr($api_key, 0, 8) . '…'),
+            ],
+        ];
+
         if (is_wp_error($response)) {
-            wp_send_json_error('Verbinding mislukt: ' . $response->get_error_message());
+            $report['response'] = ['error' => $response->get_error_message()];
+            update_option('nwws_config_fetch_status', 'error_network');
+            set_transient('nwws_config_synced', '1', 2 * MINUTE_IN_SECONDS);
+        } else {
+            $code = (int) wp_remote_retrieve_response_code($response);
+            $body = wp_remote_retrieve_body($response);
+            $report['response'] = [
+                'http_status' => $code,
+                'body'        => substr($body, 0, 500),
+            ];
+
+            if ($code === 200) {
+                $parsed = json_decode($body, true);
+                $report['parsed'] = [
+                    'inboxKey'      => $parsed['inboxKey'] ?? null,
+                    'trackingToken' => isset($parsed['trackingToken']) ? substr((string)$parsed['trackingToken'], 0, 8) . '…' : null,
+                    'connectionId'  => $parsed['connectionId'] ?? null,
+                ];
+                if (!empty($parsed['inboxKey'])) {
+                    update_option('nwws_chat_inbox_key', sanitize_text_field($parsed['inboxKey']));
+                    update_option('nwws_config_fetch_status', 'ok_configured');
+                } else {
+                    update_option('nwws_config_fetch_status', 'ok_no_inbox');
+                }
+                if (!empty($parsed['trackingToken'])) {
+                    update_option('nwws_tracking_token', sanitize_text_field($parsed['trackingToken']));
+                }
+                set_transient('nwws_config_synced', '1', HOUR_IN_SECONDS);
+            }
+
+            error_log('[NWWS Diagnostics] HTTP ' . $code . ' from ' . $request_url . ' — body: ' . substr($body, 0, 200));
         }
 
-        $code = wp_remote_retrieve_response_code($response);
-        if ($code === 200) {
-            wp_send_json_success('Verbinding succesvol!');
-        } else {
-            wp_send_json_error('Verbinding mislukt (HTTP ' . $code . ')');
-        }
+        wp_send_json_success($report);
     }
 
     public function ajax_sync_all_products(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
-        @set_time_limit(300);
+        set_time_limit(300);
 
         $page = 1; $batch = 50; $count = 0;
         do {
@@ -1030,12 +1837,13 @@ JS;
             $page++;
         } while (count($products) === $batch);
 
+        $this->append_sync_log('Producten', $count, []);
         wp_send_json_success($count . ' producten gesynchroniseerd.');
     }
 
     public function ajax_sync_all_orders(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
-        @set_time_limit(300);
+        set_time_limit(300);
 
         $page = 1; $batch = 50; $count = 0;
         do {
@@ -1047,7 +1855,37 @@ JS;
             $page++;
         } while (count($orders) === $batch);
 
+        $this->append_sync_log('Orders', $count, []);
         wp_send_json_success($count . ' orders gesynchroniseerd.');
+    }
+
+    /**
+     * Voeg een sync-actie toe aan het logboek (max. 50 entries, FIFO).
+     *
+     * @param string   $type   Leesbaar type, bijv. 'Producten' of 'Orders'.
+     * @param int      $count  Aantal verwerkte items.
+     * @param string[] $errors Lijst van foutmeldingen (leeg = geslaagd).
+     */
+    private function append_sync_log(string $type, int $count, array $errors): void {
+        $raw     = get_option('nwws_sync_log', '[]');
+        $entries = json_decode($raw, true);
+        if (!is_array($entries)) {
+            $entries = [];
+        }
+
+        $entries[] = [
+            'timestamp' => time(),
+            'type'      => $type,
+            'count'     => $count,
+            'errors'    => $errors,
+        ];
+
+        // Bewaar maximaal 50 entries
+        if (count($entries) > 50) {
+            $entries = array_slice($entries, -50);
+        }
+
+        update_option('nwws_sync_log', (string) wp_json_encode($entries));
     }
 
     public function ajax_test_push(): void {
@@ -1058,6 +1896,7 @@ JS;
 
         if (empty($push_url) || empty($push_key)) {
             wp_send_json_error('Webhook URL en API Key zijn vereist.');
+            return;
         }
 
         $response = wp_remote_get($push_url, [
@@ -1067,6 +1906,7 @@ JS;
 
         if (is_wp_error($response)) {
             wp_send_json_error('Verbinding mislukt: ' . $response->get_error_message());
+            return;
         }
 
         $code = wp_remote_retrieve_response_code($response);
@@ -1079,6 +1919,12 @@ JS;
 
     public function ajax_get_sync_stats(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
+
+        if (!class_exists('WooCommerce')) {
+            wp_send_json_error('WooCommerce niet actief.');
+            return;
+        }
+
         global $wpdb;
 
         if ($this->is_hpos_enabled()) {
@@ -1087,12 +1933,14 @@ JS;
             $orders_synced = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync' AND post_id IN (SELECT ID FROM {$wpdb->posts} WHERE post_type = 'shop_order')");
         }
 
+        $product_counts = wp_count_posts('product');
+
         wp_send_json_success([
-            'total_products'      => wp_count_posts('product')->publish,
-            'products_synced'     => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync'"),
-            'products_with_cogs'  => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_cogs' AND meta_value != ''"),
-            'total_orders'        => wc_orders_count('all'),
-            'orders_synced'       => $orders_synced,
+            'total_products'     => isset($product_counts->publish) ? (int) $product_counts->publish : 0,
+            'products_synced'    => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_nwws_last_sync'"),
+            'products_with_cogs' => (int) $wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_cogs' AND meta_value != ''"),
+            'total_orders'       => wc_orders_count('all'),
+            'orders_synced'      => $orders_synced,
         ]);
     }
 
@@ -1119,6 +1967,143 @@ JS;
 
         return true;
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // SHIPPING — dynamische verzenddag op productpagina (v1.10.0)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Bereken eerstvolgende verzenddag — exact dezelfde logica als
+     * `src/lib/shipping/calculate-next-ship-day.ts` zodat presence-sites
+     * en WC-shops identieke uitkomsten geven.
+     *
+     * @param array              $week_config  ['mon' => ['ships'=>bool, 'cutoff'=>'HH:MM'|null], ...]
+     * @param array              $exceptions   [['date'=>'YYYY-MM-DD', 'type'=>'no_shipping'|'shipping_day'], ...]
+     * @param DateTimeImmutable  $now          Huidige datum/tijd in WP-timezone
+     * @return array  ['date' => DateTimeImmutable|null, 'is_today' => bool, 'cutoff' => string|null, 'cutoff_passed' => bool]
+     */
+    public function nwws_calculate_next_ship_day(array $week_config, array $exceptions, DateTimeImmutable $now): array {
+        $day_keys = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+        // Index excepties op date-key (Y-m-d)
+        $ex_map = [];
+        foreach ($exceptions as $ex) {
+            if (!empty($ex['date']) && !empty($ex['type'])) {
+                $ex_map[$ex['date']] = $ex['type'];
+            }
+        }
+
+        $today_date_key = $now->format('Y-m-d');
+        $today_day_idx  = (int) $now->format('w'); // 0=sunday
+        $today_key      = $day_keys[$today_day_idx];
+
+        $today_cfg               = $week_config[$today_key] ?? ['ships' => false];
+        $today_exception         = $ex_map[$today_date_key] ?? null;
+        $today_ships_by_config   = !empty($today_cfg['ships']);
+        $today_ships_by_exc      = $today_exception === 'shipping_day';
+        $today_blocked_by_exc    = $today_exception === 'no_shipping';
+        $today_ships_effective   = ($today_ships_by_config || $today_ships_by_exc) && !$today_blocked_by_exc;
+        $today_cutoff            = $today_ships_by_config ? ($today_cfg['cutoff'] ?? null) : null;
+
+        $cutoff_passed = false;
+        if ($today_cutoff && preg_match('/^(\d{2}):(\d{2})$/', $today_cutoff, $m)) {
+            $cutoff_mins = ((int)$m[1]) * 60 + (int)$m[2];
+            $now_mins    = ((int)$now->format('H')) * 60 + (int)$now->format('i');
+            $cutoff_passed = $now_mins >= $cutoff_mins;
+        }
+
+        // 1. Vandaag verzenden?
+        if ($today_ships_effective && !$cutoff_passed) {
+            return [
+                'date'           => $now->setTime(0, 0, 0),
+                'is_today'       => true,
+                'cutoff'         => $today_cutoff,
+                'cutoff_passed'  => false,
+            ];
+        }
+
+        // 2. Loop max 14 dagen forward
+        for ($i = 1; $i <= 14; $i++) {
+            $cand = $now->modify("+{$i} days")->setTime(0, 0, 0);
+            $cand_key       = $day_keys[(int) $cand->format('w')];
+            $cand_date_key  = $cand->format('Y-m-d');
+            $cand_exception = $ex_map[$cand_date_key] ?? null;
+            $cand_ships     = !empty($week_config[$cand_key]['ships']);
+            $cand_by_exc    = $cand_exception === 'shipping_day';
+            $cand_blocked   = $cand_exception === 'no_shipping';
+
+            if (($cand_ships || $cand_by_exc) && !$cand_blocked) {
+                return [
+                    'date'           => $cand,
+                    'is_today'       => false,
+                    'cutoff'         => $today_cutoff,
+                    'cutoff_passed'  => $cutoff_passed,
+                ];
+            }
+        }
+
+        return [
+            'date'           => null,
+            'is_today'       => false,
+            'cutoff'         => $today_cutoff,
+            'cutoff_passed'  => $cutoff_passed,
+        ];
+    }
+
+    /**
+     * Render het verzendregeltje onder de productprijs. Hook:
+     * `woocommerce_single_product_summary` priority 25.
+     */
+    public function nwws_render_shipping_info(): void {
+        global $product;
+        if (!$product || !function_exists('wc_get_product')) return;
+
+        $default    = get_option('nwws_shipping_default', null);
+        $overrides  = get_option('nwws_shipping_overrides', []);
+        $exceptions = get_option('nwws_shipping_exceptions', []);
+
+        if (!is_array($default) || empty($default['week_config'])) return;
+
+        // Match categorie-override: pak de eerste matching categorie van het product
+        $week_config = $default['week_config'];
+        $message_tpl = $default['message_tpl'] ?? 'Vóór [cutoff] besteld? [verzenddag] verzonden.';
+
+        $product_cat_terms = get_the_terms($product->get_id(), 'product_cat');
+        if (is_array($overrides) && is_array($product_cat_terms)) {
+            foreach ($product_cat_terms as $term) {
+                foreach ($overrides as $ov) {
+                    if (!empty($ov['category_slug']) && $ov['category_slug'] === $term->slug && !empty($ov['week_config'])) {
+                        $week_config = $ov['week_config'];
+                        if (!empty($ov['message_tpl'])) $message_tpl = $ov['message_tpl'];
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        try {
+            $tz  = wp_timezone();
+            $now = new DateTimeImmutable('now', $tz);
+        } catch (Exception $e) {
+            return;
+        }
+
+        $result = $this->nwws_calculate_next_ship_day($week_config, is_array($exceptions) ? $exceptions : [], $now);
+        if (empty($result['date'])) return;
+
+        // Render template
+        $weekdays = ['zondag', 'maandag', 'dinsdag', 'woensdag', 'donderdag', 'vrijdag', 'zaterdag'];
+        $verzenddag = $result['is_today'] ? 'vandaag' : $weekdays[(int) $result['date']->format('w')];
+        $datum_fmt = wp_date('j F Y', $result['date']->getTimestamp());
+        $cutoff = $result['cutoff'] ?? '';
+
+        $message = $message_tpl;
+        $message = str_ireplace('[verzenddag]', $verzenddag, $message);
+        $message = str_ireplace('[datum]',      $datum_fmt,  $message);
+        $message = str_ireplace('[cutoff]',     $cutoff,     $message);
+
+        echo '<p class="nwws-shipping-info" style="margin:0.5em 0;color:#555;font-size:0.9em;">' . esc_html($message) . '</p>';
+    }
 }
 
 // Boot
@@ -1132,7 +2117,7 @@ add_action('plugins_loaded', function () {
     new Neura_GitHub_Updater(NWWS_PLUGIN_FILE, NWWS_VERSION, NWWS_GITHUB_OWNER, NWWS_GITHUB_REPO);
 }, 20);
 
-// Activation defaults
+// Activation defaults + cron schedule
 register_activation_hook(__FILE__, function () {
     add_option('nwws_sync_enabled',           '0');
     add_option('nwws_sync_products',          '1');
@@ -1151,6 +2136,10 @@ register_activation_hook(__FILE__, function () {
     add_option('nwws_sync_fields_categories', '1');
     add_option('nwws_chat_enabled',           '0');
     add_option('nwws_chat_inbox_key',         '');
+
+    if (!wp_next_scheduled('nwws_poll_sync')) {
+        wp_schedule_event(time(), 'nwws_every_minute', 'nwws_poll_sync');
+    }
 });
 
 // =============================================================================
@@ -1174,13 +2163,6 @@ add_filter('cron_schedules', function (array $schedules): array {
         ];
     }
     return $schedules;
-});
-
-// Cron event plannen bij activatie
-register_activation_hook(__FILE__, function () {
-    if (!wp_next_scheduled('nwws_poll_sync')) {
-        wp_schedule_event(time(), 'nwws_every_minute', 'nwws_poll_sync');
-    }
 });
 
 // Cron event verwijderen bij deactivatie
@@ -1235,7 +2217,6 @@ function nwws_run_poll_sync(): void {
 
             $payload = [];
             foreach ($products as $product) {
-                $data_store = $product->get_data();
                 $attrs = [];
                 foreach ($product->get_attributes() as $attr_key => $attr) {
                     $attrs[] = [

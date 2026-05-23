@@ -1,8 +1,10 @@
 <?php
+declare(strict_types=1);
 /**
  * Stripped HTML van alle pagebuilder rommel.
  * Resultaat is semantische HTML met alleen inhoudelijke tags.
  */
+defined('ABSPATH') || exit;
 class NWWS_Content_Cleaner {
 
     // Tags die we willen bewaren
