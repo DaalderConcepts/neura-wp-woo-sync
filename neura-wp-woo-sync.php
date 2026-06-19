@@ -4,7 +4,7 @@ declare(strict_types=1);
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.11.1
+ * Version:      1.12.0
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -17,7 +17,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.11.1');
+define('NWWS_VERSION',    '1.12.0');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -493,6 +493,10 @@ JS;
         // Exclude the Neuramerce widget-loader from WP Rocket delay/minification.
         // Pattern matches both the external URL and the locally cached minified copy.
         $exclusions[] = 'widget-loader';
+        // Ook track.js (server-side attributie) + de inline NauraTrack-bootstrap uitsluiten,
+        // anders vertraagt WP Rocket de fingerprint vroeg in <head> en missen we touchpoints.
+        $exclusions[] = 'track.js';
+        $exclusions[] = 'NauraTrack';
         return $exclusions;
     }
 
@@ -566,7 +570,11 @@ JS;
     public function render_settings_page(): void {
         if (isset($_POST['nwws_save_settings'])) {
             check_admin_referer('nwws_settings');
+            $save_section = sanitize_key($_POST['nwws_save_section'] ?? '');
 
+            // --- Connectie-velden: Connect-tab (of legacy gecombineerd formulier) ---
+            // Section-guard: opslaan vanuit één tab mag de velden van de andere tab niet wissen.
+            if ($save_section !== 'woocommerce') {
             $prev_api_key = get_option('nwws_api_key', '');
             $prev_conn_id = get_option('nwws_connection_id', '');
             $new_api_url  = sanitize_text_field($_POST['nwws_api_url'] ?? 'https://app.neuramerce.com/api');
@@ -588,6 +596,10 @@ JS;
             parse_str(parse_url($saved_push_url, PHP_URL_QUERY) ?? '', $parsed_qs);
             $extracted_ws = sanitize_text_field($parsed_qs['workspace'] ?? $_POST['nwws_workspace_id'] ?? '');
             if (!empty($extracted_ws)) update_option('nwws_workspace_id', $extracted_ws);
+            } // einde connectie-velden
+
+            // --- Sync-/veld-/chat-/tracking-velden: WooCommerce-tab (of legacy) ---
+            if ($save_section !== 'connect') {
             update_option('nwws_sync_enabled',             !empty($_POST['nwws_sync_enabled'])             ? '1' : '0');
             update_option('nwws_sync_products',            !empty($_POST['nwws_sync_products'])            ? '1' : '0');
             update_option('nwws_sync_orders',              !empty($_POST['nwws_sync_orders'])              ? '1' : '0');
@@ -615,9 +627,12 @@ JS;
             update_option('nwws_ai_expose_order_status',  !empty($_POST['nwws_ai_expose_order_status'])  ? '1' : '0');
             update_option('nwws_ai_expose_customer_data', !empty($_POST['nwws_ai_expose_customer_data']) ? '1' : '0');
             update_option('nwws_ai_expose_cart_contents', !empty($_POST['nwws_ai_expose_cart_contents']) ? '1' : '0');
+            } // einde sync-velden
 
+            // --- Auto-fetch workspace config (alleen bij Connect-save of legacy) ---
             // Auto-fetch workspace config als inbox key nog leeg is na opslaan POST-data
             // (auto-fetch pas hier zodat POST-waarden niet overschreven worden door de fetch)
+            if ($save_section !== 'woocommerce') {
             $current_inbox_key = get_option('nwws_chat_inbox_key', '');
             if (!empty($new_api_key) && !empty($new_conn_id) && empty($current_inbox_key)) {
                 $config_url = rtrim($new_api_url ?: 'https://app.neuramerce.com/api', '/') . '/v1/woocommerce/workspace-config';
@@ -641,6 +656,7 @@ JS;
                 }
                 echo '<div class="notice notice-' . esc_attr($notice_type) . '"><p>' . wp_kses($notice_msg, ['a' => ['href' => []]]) . '</p></div>';
             }
+            } // einde auto-fetch
 
             echo '<div class="notice notice-success"><p>Instellingen opgeslagen!</p></div>';
         }
