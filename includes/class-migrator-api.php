@@ -1495,37 +1495,90 @@ class NWWS_Migrator_API {
                 'order'          => 'ASC',
             ] );
 
+            // Get quizzes (stored as separate posts, parented to topics)
+            $topic_ids = wp_list_pluck( $topics, 'ID' );
+            $quizzes   = ! empty( $topic_ids )
+                ? get_posts( [
+                    'post_type'         => 'tutor_quiz',
+                    'post_parent__in'   => $topic_ids,
+                    'post_status'       => 'publish',
+                    'posts_per_page'    => -1,
+                    'orderby'           => 'menu_order',
+                    'order'             => 'ASC',
+                ] )
+                : [];
+
             $meta = get_post_meta( $course->ID );
 
-            return [
-                'id'          => $course->ID,
-                'slug'        => $course->post_name,
-                'title'       => $course->post_title,
-                'excerpt'     => $course->post_excerpt,
-                'content'     => NWWS_Content_Cleaner::clean( $course->post_content ),
-                'featuredImg' => get_the_post_thumbnail_url( $course->ID, 'full' ) ?: null,
-                'price'       => (float) ( $meta['_tutor_course_price'][0] ?? 0 ),
-                'isFree'      => empty( $meta['_tutor_course_price'][0] ),
-                'level'       => $meta['_tutor_course_level'][0] ?? null,
-                'duration'    => $meta['_tutor_course_duration'][0] ?? null,
-                'categories'  => wp_get_post_terms( $course->ID, 'course-category', [ 'fields' => 'names' ] ),
-                'tags'        => wp_get_post_terms( $course->ID, 'course-tag', [ 'fields' => 'names' ] ),
-                'topics'      => array_map( fn( $t ) => [
-                    'id'    => $t->ID,
-                    'title' => $t->post_title,
-                    'order' => $t->menu_order,
-                ], $topics ),
-                'lessons'     => array_map( fn( $l ) => [
+            // Regular lessons → normalised lesson map
+            $lesson_items = array_map( function( $l ) use ( $course ) {
+                return [
                     'id'       => $l->ID,
                     'slug'     => $l->post_name,
                     'title'    => $l->post_title,
+                    'type'     => 'lesson',
                     'content'  => NWWS_Content_Cleaner::clean( $l->post_content ),
                     'topicId'  => $l->post_parent !== $course->ID ? $l->post_parent : null,
                     'order'    => $l->menu_order,
                     'duration' => get_post_meta( $l->ID, '_tutor_lesson_duration', true ) ?: null,
-                ], $lessons ),
-                'seo'         => self::get_seo_meta( $course->ID ),
-                'publishedAt' => $course->post_date,
+                    'videoUrl' => self::build_lesson_video_url( $l->ID ),
+                    'isFree'   => get_post_meta( $l->ID, '_is_preview', true ) === '1',
+                ];
+            }, $lessons );
+
+            // Quizzes → merged into the lesson map as type=quiz
+            $quiz_items = array_map( fn( $q ) => [
+                'id'       => $q->ID,
+                'slug'     => $q->post_name,
+                'title'    => $q->post_title,
+                'type'     => 'quiz',
+                'content'  => '',
+                'topicId'  => $q->post_parent !== $course->ID ? $q->post_parent : null,
+                'order'    => $q->menu_order,
+                'duration' => null,
+                'videoUrl' => null,
+                'isFree'   => false,
+                'quiz'     => self::get_quiz_payload( $q->ID ),
+            ], $quizzes );
+
+            $all_lessons = array_merge( $lesson_items, $quiz_items );
+            usort( $all_lessons, function( $a, $b ) {
+                $ta = (int) $a['topicId'];
+                $tb = (int) $b['topicId'];
+                if ( $ta !== $tb ) {
+                    return $ta <=> $tb;
+                }
+                return (int) $a['order'] <=> (int) $b['order'];
+            } );
+
+            $requirements = maybe_unserialize( get_post_meta( $course->ID, '_tutor_course_requirements', true ) );
+            $benefits     = maybe_unserialize( get_post_meta( $course->ID, '_tutor_course_benefits', true ) );
+
+            return [
+                'id'           => $course->ID,
+                'slug'         => $course->post_name,
+                'title'        => $course->post_title,
+                'excerpt'      => $course->post_excerpt,
+                'content'      => NWWS_Content_Cleaner::clean( $course->post_content ),
+                'featuredImg'  => get_the_post_thumbnail_url( $course->ID, 'full' ) ?: null,
+                'price'        => (float) ( $meta['_tutor_course_price'][0] ?? 0 ),
+                'isFree'       => empty( $meta['_tutor_course_price'][0] ),
+                'level'        => $meta['_tutor_course_level'][0] ?? null,
+                'duration'     => $meta['_tutor_course_duration'][0] ?? null,
+                'language'     => 'nl',
+                'requirements' => is_array( $requirements ) ? array_values( $requirements ) : [],
+                'outcomes'     => is_array( $benefits ) ? array_values( $benefits ) : [],
+                'categories'   => wp_get_post_terms( $course->ID, 'course-category', [ 'fields' => 'names' ] ),
+                'tags'         => wp_get_post_terms( $course->ID, 'course-tag', [ 'fields' => 'names' ] ),
+                'topics'       => array_map( fn( $t ) => [
+                    'id'    => $t->ID,
+                    'title' => $t->post_title,
+                    'order' => $t->menu_order,
+                ], $topics ),
+                'lessons'      => $all_lessons,
+                'enrollments'  => self::get_course_enrollments( $course->ID ),
+                'seo'          => self::get_seo_meta( $course->ID ),
+                'publishedAt'  => $course->post_date,
             ];
         }, $query->posts );
 
@@ -1538,6 +1591,123 @@ class NWWS_Migrator_API {
             'pages'    => (int) ceil( $total / $per ),
             'items'    => $data,
         ] );
+    }
+
+    /**
+     * Build a single canonical video URL for a Tutor lesson from its `_video` meta.
+     */
+    private static function build_lesson_video_url( int $lesson_id ): ?string {
+        $video = maybe_unserialize( get_post_meta( $lesson_id, '_video', true ) );
+        if ( ! is_array( $video ) ) {
+            return null;
+        }
+
+        $source = $video['source'] ?? null;
+
+        switch ( $source ) {
+            case 'youtube':
+                $yt = $video['source_youtube'] ?? '';
+                if ( empty( $yt ) ) {
+                    return null;
+                }
+                return ( strpos( $yt, 'http' ) === 0 )
+                    ? $yt
+                    : 'https://www.youtube.com/watch?v=' . $yt;
+
+            case 'vimeo':
+                $vm = $video['source_vimeo'] ?? '';
+                if ( empty( $vm ) ) {
+                    return null;
+                }
+                return ( strpos( $vm, 'http' ) === 0 )
+                    ? $vm
+                    : 'https://vimeo.com/' . $vm;
+
+            case 'external_url':
+                return ! empty( $video['source_external_url'] ) ? $video['source_external_url'] : null;
+
+            case 'html5':
+                $attachment_id = (int) ( $video['source_video_id'] ?? 0 );
+                return $attachment_id ? ( wp_get_attachment_url( $attachment_id ) ?: null ) : null;
+
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Read a Tutor quiz's passing grade + questions/answers from the custom tables.
+     */
+    private static function get_quiz_payload( int $quiz_id ): array {
+        global $wpdb;
+
+        $options       = maybe_unserialize( get_post_meta( $quiz_id, 'tutor_quiz_option', true ) );
+        $passing_grade = ( is_array( $options ) && isset( $options['passing_grade'] ) )
+            ? (int) $options['passing_grade']
+            : 70;
+
+        $questions = $wpdb->get_results( $wpdb->prepare(
+            "SELECT question_id, question_title, question_description, question_type, question_mark, question_order
+             FROM {$wpdb->prefix}tutor_quiz_questions WHERE quiz_id = %d ORDER BY question_order ASC",
+            $quiz_id
+        ) );
+
+        $question_items = array_map( function( $q ) use ( $wpdb ) {
+            $answers = $wpdb->get_results( $wpdb->prepare(
+                "SELECT answer_id, answer_title, is_correct, answer_order
+                 FROM {$wpdb->prefix}tutor_quiz_question_answers WHERE belongs_question_id = %d ORDER BY answer_order ASC",
+                $q->question_id
+            ) );
+
+            return [
+                'id'          => (int) $q->question_id,
+                'title'       => $q->question_title,
+                'description' => $q->question_description,
+                'type'        => $q->question_type,
+                'mark'        => (int) $q->question_mark,
+                'order'       => (int) $q->question_order,
+                'answers'     => array_map( fn( $a ) => [
+                    'id'        => (int) $a->answer_id,
+                    'title'     => $a->answer_title,
+                    'isCorrect' => (bool) (int) $a->is_correct,
+                    'order'     => (int) $a->answer_order,
+                ], $answers ?: [] ),
+            ];
+        }, $questions ?: [] );
+
+        return [
+            'passingGrade' => $passing_grade,
+            'questions'    => $question_items,
+        ];
+    }
+
+    /**
+     * Fetch enrolled students for a course (Tutor stores these as tutor_enrolled posts).
+     */
+    private static function get_course_enrollments( int $course_id ): array {
+        $enrolled = get_posts( [
+            'post_type'      => 'tutor_enrolled',
+            'post_parent'    => $course_id,
+            'post_status'    => 'any',
+            'posts_per_page' => 2000,
+        ] );
+
+        $items = [];
+        foreach ( $enrolled as $enr ) {
+            $user = get_userdata( $enr->post_author );
+            if ( ! $user || empty( $user->user_email ) ) {
+                continue;
+            }
+
+            $items[] = [
+                'email'      => $user->user_email,
+                'name'       => $user->display_name ?: $user->user_login,
+                'status'     => $enr->post_status === 'completed' ? 'completed' : 'active',
+                'enrolledAt' => $enr->post_date,
+            ];
+        }
+
+        return $items;
     }
 
     // ─── Navigatiemenu's ──────────────────────────────────────────────────────

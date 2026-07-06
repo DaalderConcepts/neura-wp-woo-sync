@@ -4,7 +4,7 @@ declare(strict_types=1);
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.12.0
+ * Version:      1.12.1
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -17,7 +17,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.12.0');
+define('NWWS_VERSION',    '1.12.1');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -707,6 +707,10 @@ JS;
                class="nav-tab <?php echo $active_tab === 'migrate' ? 'nav-tab-active' : ''; ?>">
                 Migratie
             </a>
+            <a href="<?php echo esc_url($page_url . '&tab=courses'); ?>"
+               class="nav-tab <?php echo $active_tab === 'courses' ? 'nav-tab-active' : ''; ?>">
+                Cursussen
+            </a>
             <a href="<?php echo esc_url($page_url . '&tab=logs'); ?>"
                class="nav-tab <?php echo $active_tab === 'logs' ? 'nav-tab-active' : ''; ?>">
                 Logs
@@ -717,6 +721,8 @@ JS;
             include NWWS_PLUGIN_DIR . 'templates/tab-woocommerce.php';
         } elseif ($active_tab === 'migrate') {
             include NWWS_PLUGIN_DIR . 'templates/migration-tab.php';
+        } elseif ($active_tab === 'courses') {
+            include NWWS_PLUGIN_DIR . 'templates/courses-tab.php';
         } elseif ($active_tab === 'logs') {
             include NWWS_PLUGIN_DIR . 'templates/tab-logs.php';
         } else {
