@@ -1,6 +1,6 @@
 # Changelog — Neura WooCommerce Sync
 
-## [1.12.1] — 2026-07-06
+## [1.14.1] — 2026-07-06
 
 ### Added
 - **Tutor LMS course-export verrijkt** — `/wp-json/neuramerce/v1/courses` levert nu per les een canonieke `videoUrl` (uit `_video`-meta: YouTube/Vimeo/extern/HTML5), gratis-preview-vlag (`_is_preview`), en quizvragen+antwoorden (`tutor_quiz`-posts + `tutor_quiz_questions`/`tutor_quiz_question_answers`-tabellen). Course-niveau: `requirements`, `outcomes` (uit `_tutor_course_benefits`), `language`, en `enrollments` (uit `tutor_enrolled`, incl. status).
