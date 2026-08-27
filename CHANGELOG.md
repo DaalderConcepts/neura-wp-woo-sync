@@ -1,5 +1,10 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.14.2] - 2026-08-27
+
+### Fixed
+- **`/order-statuses` registreerde met methods `"WOWT"`**: de dual-method "review-fix" uit v1.11.0 deed `WP_REST_Server::READABLE | WP_REST_Server::CREATABLE`, maar dat zijn strings ('GET', 'POST') en PHP's bitwise `|` maakt daar tekenreeks "WOWT" van. Gevolg: elke GET/POST op `/order-statuses` gaf `rest_no_route` (gemeten op nomadfire.shop), waardoor Neura de custom statussenlijst nooit kon pushen en elke per-order statuspush daarna met `unknown_status` faalde. Nu een array `['GET','POST']`.
+
 ## [1.14.1] — 2026-07-06
 
 ### Added

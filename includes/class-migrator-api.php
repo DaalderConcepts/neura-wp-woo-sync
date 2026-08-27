@@ -147,7 +147,9 @@ class NWWS_Migrator_API {
         // aparte calls. Voorkomt edge-case op multisite waar tweede registratie
         // de eerste kan overriden bij dubbele plugin-init.
         register_rest_route( self::NAMESPACE, '/order-statuses', [
-            'methods'             => WP_REST_Server::READABLE | WP_REST_Server::CREATABLE,
+            // Let op: READABLE en CREATABLE zijn strings; een bitwise | maakt er
+            // het onzinnige "WOWT" van waardoor élke GET/POST rest_no_route gaf.
+            'methods'             => [ WP_REST_Server::READABLE, WP_REST_Server::CREATABLE ],
             'callback'            => [ __CLASS__, 'order_statuses_dispatch' ],
             'permission_callback' => $auth,
         ] );
