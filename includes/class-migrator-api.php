@@ -173,6 +173,20 @@ class NWWS_Migrator_API {
             ],
         ] );
 
+        // POST /orders/{id}/complete — zet één WC-order op de kern-status
+        // 'completed' (verzonden) + optioneel trackingnummer/vervoerder + notitie.
+        // PHP-route die de wc/v3 REST-PUT vervangt wanneer die door de host-WAF
+        // (Cloudflare/Kinsta) geblokkeerd wordt — draait binnen WordPress, dus
+        // geen edge-blokkade. Body: { status?, tracking_number?, tracking_carrier?, note? }
+        register_rest_route( self::NAMESPACE, '/orders/(?P<id>\d+)/complete', [
+            'methods'             => 'POST',
+            'callback'            => [ __CLASS__, 'complete_order' ],
+            'permission_callback' => $auth,
+            'args'                => [
+                'id' => [ 'required' => true, 'sanitize_callback' => 'absint' ],
+            ],
+        ] );
+
         // POST /shipping-schedules — volledige snapshot van shipping-config.
         // Body: { default: {...}, overrides: [{category_slug, week_config, message_tpl}], exceptions: [{date, type, label}] }
         register_rest_route( self::NAMESPACE, '/shipping-schedules', [
@@ -303,7 +317,7 @@ class NWWS_Migrator_API {
                 'id'          => (int) $t->term_id,
                 'name'        => $t->name,
                 'slug'        => $t->slug,
-                'description' => wp_strip_all_tags( (string) $t->description ),
+                'description' => wp_kses_post( (string) $t->description ),
                 'parentId'    => $t->parent ? (int) $t->parent : null,
                 'count'       => (int) $t->count,
                 'image'       => $image_url,
@@ -1019,7 +1033,7 @@ class NWWS_Migrator_API {
                     'id'          => $t->term_id,
                     'name'        => $t->name,
                     'slug'        => $t->slug,
-                    'description' => wp_strip_all_tags( $t->description ),
+                    'description' => wp_kses_post( $t->description ),
                     'parentId'    => $t->parent ?: null,
                     'count'       => $t->count,
                     'image'       => $thumb_id ? wp_get_attachment_image_url( $thumb_id, 'full' ) : null,
@@ -1477,17 +1491,11 @@ class NWWS_Migrator_API {
         $total = $query->found_posts;
 
         $data = array_map( function( $course ) {
-            // Get lessons for this course
-            $lessons = get_posts( [
-                'post_type'      => 'lesson',
-                'post_parent'    => $course->ID,
-                'post_status'    => 'publish',
-                'posts_per_page' => -1,
-                'orderby'        => 'menu_order',
-                'order'          => 'ASC',
-            ] );
-
-            // Get topics (lesson groupings)
+            // Topics EERST: lessen/quizzes/opdrachten hangen in Tutor aan het
+            // TOPIC (post_parent = topic-ID), niet rechtstreeks aan de cursus.
+            // De oude query hieronder gebruikte post_parent=$course->ID voor
+            // lessen, wat bij elke cursus mét secties (de norm) 0 lessen vond —
+            // alleen de quiz kwam mee omdat die al wél via topic_ids liep.
             $topics = get_posts( [
                 'post_type'      => 'topics',
                 'post_parent'    => $course->ID,
@@ -1496,10 +1504,23 @@ class NWWS_Migrator_API {
                 'orderby'        => 'menu_order',
                 'order'          => 'ASC',
             ] );
-
-            // Get quizzes (stored as separate posts, parented to topics)
             $topic_ids = wp_list_pluck( $topics, 'ID' );
-            $quizzes   = ! empty( $topic_ids )
+
+            // Lessen hangen aan een topic; een enkele oude/vlakke cursus zonder
+            // secties hangt lessen rechtstreeks aan de cursus — beide parents in
+            // dezelfde query zodat niets stil verdwijnt.
+            $lesson_parents = ! empty( $topic_ids ) ? array_merge( $topic_ids, [ $course->ID ] ) : [ $course->ID ];
+            $lessons = get_posts( [
+                'post_type'       => 'lesson',
+                'post_parent__in' => $lesson_parents,
+                'post_status'     => 'publish',
+                'posts_per_page'  => -1,
+                'orderby'         => 'menu_order',
+                'order'           => 'ASC',
+            ] );
+
+            // Quizzes (stored as separate posts, parented to topics)
+            $quizzes = ! empty( $topic_ids )
                 ? get_posts( [
                     'post_type'         => 'tutor_quiz',
                     'post_parent__in'   => $topic_ids,
@@ -1510,7 +1531,22 @@ class NWWS_Migrator_API {
                 ] )
                 : [];
 
-            $meta = get_post_meta( $course->ID );
+            // Opdrachten (Pro-addon post-type) — zelfde patroon als quiz, alleen
+            // relevant als de addon actief is.
+            $assignments = ( ! empty( $topic_ids ) && post_type_exists( 'tutor_assignments' ) )
+                ? get_posts( [
+                    'post_type'         => 'tutor_assignments',
+                    'post_parent__in'   => $topic_ids,
+                    'post_status'       => 'publish',
+                    'posts_per_page'    => -1,
+                    'orderby'           => 'menu_order',
+                    'order'             => 'ASC',
+                ] )
+                : [];
+
+            $meta     = get_post_meta( $course->ID );
+            $settings = maybe_unserialize( $meta['_tutor_course_settings'][0] ?? '' );
+            $settings = is_array( $settings ) ? $settings : [];
 
             // Regular lessons → normalised lesson map
             $lesson_items = array_map( function( $l ) use ( $course ) {
@@ -1543,7 +1579,22 @@ class NWWS_Migrator_API {
                 'quiz'     => self::get_quiz_payload( $q->ID ),
             ], $quizzes );
 
-            $all_lessons = array_merge( $lesson_items, $quiz_items );
+            // Opdrachten → merged into the lesson map as type=assignment (Neura
+            // toont dit vooralsnog als tekstles; inhoud = opdracht-omschrijving).
+            $assignment_items = array_map( fn( $a ) => [
+                'id'       => $a->ID,
+                'slug'     => $a->post_name,
+                'title'    => $a->post_title,
+                'type'     => 'assignment',
+                'content'  => NWWS_Content_Cleaner::clean( $a->post_content ),
+                'topicId'  => $a->post_parent !== $course->ID ? $a->post_parent : null,
+                'order'    => $a->menu_order,
+                'duration' => null,
+                'videoUrl' => null,
+                'isFree'   => false,
+            ], $assignments );
+
+            $all_lessons = array_merge( $lesson_items, $quiz_items, $assignment_items );
             usort( $all_lessons, function( $a, $b ) {
                 $ta = (int) $a['topicId'];
                 $tb = (int) $b['topicId'];
@@ -1553,8 +1604,34 @@ class NWWS_Migrator_API {
                 return (int) $a['order'] <=> (int) $b['order'];
             } );
 
-            $requirements = maybe_unserialize( get_post_meta( $course->ID, '_tutor_course_requirements', true ) );
-            $benefits     = maybe_unserialize( get_post_meta( $course->ID, '_tutor_course_benefits', true ) );
+            // Cursus-instellingen: Tutor slaat deze soms als losse meta-key op,
+            // soms alléén genest in _tutor_course_settings (array of newline-
+            // tekst) — probeer de losse key eerst, val terug op de geneste vorm.
+            $requirements = self::tutor_list_meta( $meta['_tutor_course_requirements'][0] ?? null, $settings['course_requirements'] ?? null );
+            $benefits     = self::tutor_list_meta( $meta['_tutor_course_benefits'][0] ?? null, $settings['course_benefits'] ?? null );
+            $level        = $meta['_tutor_course_level'][0] ?? ( $settings['course_level'] ?? null );
+
+            $duration_raw = $meta['_tutor_course_duration'][0] ?? ( $settings['course_duration'] ?? null );
+            $duration_val = maybe_unserialize( $duration_raw );
+            if ( is_array( $duration_val ) ) {
+                $duration_val = sprintf( '%02d:%02d:00', (int) ( $duration_val['hours'] ?? 0 ), (int) ( $duration_val['minutes'] ?? 0 ) );
+            }
+
+            // Prijs: normaal een losse meta, maar bij Tutor+WooCommerce-koppeling
+            // (dit is een wp-woo-sync-site) staat de échte prijs op het gekoppelde
+            // WC-product — val daarop terug als de losse meta 0/leeg is én de
+            // cursus niet expliciet op "gratis" staat.
+            $price      = (float) ( $meta['_tutor_course_price'][0] ?? 0 );
+            $price_type = $meta['_tutor_course_price_type'][0] ?? ( $settings['course_price_type'] ?? null );
+            if ( $price <= 0 && $price_type !== 'free' && function_exists( 'wc_get_product' ) ) {
+                $product_id = (int) ( $meta['_tutor_course_product_id'][0] ?? ( $settings['course_product_id'] ?? 0 ) );
+                if ( $product_id ) {
+                    $wc_product = wc_get_product( $product_id );
+                    if ( $wc_product ) {
+                        $price = (float) $wc_product->get_price();
+                    }
+                }
+            }
 
             return [
                 'id'           => $course->ID,
@@ -1563,13 +1640,13 @@ class NWWS_Migrator_API {
                 'excerpt'      => $course->post_excerpt,
                 'content'      => NWWS_Content_Cleaner::clean( $course->post_content ),
                 'featuredImg'  => get_the_post_thumbnail_url( $course->ID, 'full' ) ?: null,
-                'price'        => (float) ( $meta['_tutor_course_price'][0] ?? 0 ),
-                'isFree'       => empty( $meta['_tutor_course_price'][0] ),
-                'level'        => $meta['_tutor_course_level'][0] ?? null,
-                'duration'     => $meta['_tutor_course_duration'][0] ?? null,
+                'price'        => $price,
+                'isFree'       => $price <= 0,
+                'level'        => $level ?: null,
+                'duration'     => $duration_val ?: null,
                 'language'     => 'nl',
-                'requirements' => is_array( $requirements ) ? array_values( $requirements ) : [],
-                'outcomes'     => is_array( $benefits ) ? array_values( $benefits ) : [],
+                'requirements' => $requirements,
+                'outcomes'     => $benefits,
                 'categories'   => wp_get_post_terms( $course->ID, 'course-category', [ 'fields' => 'names' ] ),
                 'tags'         => wp_get_post_terms( $course->ID, 'course-tag', [ 'fields' => 'names' ] ),
                 'topics'       => array_map( fn( $t ) => [
@@ -1579,6 +1656,7 @@ class NWWS_Migrator_API {
                 ], $topics ),
                 'lessons'      => $all_lessons,
                 'enrollments'  => self::get_course_enrollments( $course->ID ),
+                'reviews'      => self::get_course_reviews( $course->ID ),
                 'seo'          => self::get_seo_meta( $course->ID ),
                 'publishedAt'  => $course->post_date,
             ];
@@ -1593,6 +1671,23 @@ class NWWS_Migrator_API {
             'pages'    => (int) ceil( $total / $per ),
             'items'    => $data,
         ] );
+    }
+
+    /**
+     * Requirements/benefits: Tutor slaat dit soms op als array, soms als
+     * newline-gescheiden tekst — normaliseer beide vormen naar string[].
+     */
+    private static function tutor_list_meta( $flat, $settings_val ): array {
+        $raw = ( $flat !== null && $flat !== '' ) ? $flat : $settings_val;
+        $val = maybe_unserialize( $raw );
+
+        if ( is_array( $val ) ) {
+            return array_values( array_filter( array_map( 'trim', $val ) ) );
+        }
+        if ( is_string( $val ) && trim( $val ) !== '' ) {
+            return array_values( array_filter( array_map( 'trim', preg_split( '/\r\n|\r|\n/', $val ) ) ) );
+        }
+        return [];
     }
 
     /**
@@ -1644,12 +1739,29 @@ class NWWS_Migrator_API {
         global $wpdb;
 
         $options       = maybe_unserialize( get_post_meta( $quiz_id, 'tutor_quiz_option', true ) );
-        $passing_grade = ( is_array( $options ) && isset( $options['passing_grade'] ) )
-            ? (int) $options['passing_grade']
-            : 70;
+        $options       = is_array( $options ) ? $options : [];
+        $passing_grade = isset( $options['passing_grade'] ) ? (int) $options['passing_grade'] : 70;
 
+        // Quiz-brede instellingen. Nog niet afgedwongen in de Neura-speler, maar
+        // wél meegenomen zodat een latere uitbreiding (pogingen/tijdslimiet/
+        // feedback-modus) geen her-import vereist.
+        $tl_value = isset( $options['time_limit']['time_value'] ) ? (int) $options['time_limit']['time_value'] : 0;
+        $tl_unit  = $options['time_limit']['time_type'] ?? 'minutes';
+        $settings = [
+            'attemptsAllowed'      => isset( $options['attempts_allowed'] ) ? (int) $options['attempts_allowed'] : null,
+            'timeLimitValue'       => $tl_value ?: null,
+            'timeLimitUnit'        => $tl_unit,
+            'feedbackMode'         => $options['feedback_mode'] ?? null,   // default | reveal | retry
+            'questionsOrder'       => $options['questions_order'] ?? null, // rand | sorting | asc | desc
+            'maxQuestionsToAnswer' => isset( $options['max_questions_for_answer'] ) ? (int) $options['max_questions_for_answer'] : null,
+        ];
+
+        // question_settings (geserialiseerd) bevat de échte "meerdere antwoorden"-
+        // toggle — Tutor slaat élke keuzevraag op als type 'multiple_choice', dus
+        // het type zegt NIETS over enkel/meervoudig. `has_multiple_correct_answer`
+        // is de enige betrouwbare bron.
         $questions = $wpdb->get_results( $wpdb->prepare(
-            "SELECT question_id, question_title, question_description, question_type, question_mark, question_order
+            "SELECT question_id, question_title, question_description, question_type, question_mark, question_order, question_settings, answer_explanation
              FROM {$wpdb->prefix}tutor_quiz_questions WHERE quiz_id = %d ORDER BY question_order ASC",
             $quiz_id
         ) );
@@ -1661,14 +1773,23 @@ class NWWS_Migrator_API {
                 $q->question_id
             ) );
 
+            $qs = maybe_unserialize( $q->question_settings );
+            $qs = is_array( $qs ) ? $qs : [];
+
             return [
-                'id'          => (int) $q->question_id,
-                'title'       => $q->question_title,
-                'description' => $q->question_description,
-                'type'        => $q->question_type,
-                'mark'        => (int) $q->question_mark,
-                'order'       => (int) $q->question_order,
-                'answers'     => array_map( fn( $a ) => [
+                'id'              => (int) $q->question_id,
+                'title'           => $q->question_title,
+                'description'     => $q->question_description,
+                'type'            => $q->question_type,
+                'mark'            => (int) $q->question_mark,
+                'order'           => (int) $q->question_order,
+                // DE bron voor "meerdere antwoorden mogelijk" (Tutor-toggle
+                // "Meervoudig juist antwoord"). Niet afleiden uit het type.
+                'multipleCorrect' => ! empty( $qs['has_multiple_correct_answer'] ),
+                'answerRequired'  => ! isset( $qs['answer_required'] ) || (bool) $qs['answer_required'],
+                'randomize'       => ! empty( $qs['randomize_question'] ),
+                'explanation'     => $q->answer_explanation ?: null,
+                'answers'         => array_map( fn( $a ) => [
                     'id'        => (int) $a->answer_id,
                     'title'     => $a->answer_title,
                     'isCorrect' => (bool) (int) $a->is_correct,
@@ -1679,6 +1800,7 @@ class NWWS_Migrator_API {
 
         return [
             'passingGrade' => $passing_grade,
+            'settings'     => $settings,
             'questions'    => $question_items,
         ];
     }
@@ -1706,6 +1828,58 @@ class NWWS_Migrator_API {
                 'name'       => $user->display_name ?: $user->user_login,
                 'status'     => $enr->post_status === 'completed' ? 'completed' : 'active',
                 'enrolledAt' => $enr->post_date,
+            ];
+        }
+
+        return $items;
+    }
+
+    /**
+     * Cursus-reviews. Tutor slaat course-ratings op als WP-comments met
+     * comment_type 'tutor_course_rating' op de cursus-post; de score staat in
+     * comment-meta 'tutor_rating' (1-5).
+     *
+     * ⚠️⚠️ Tutor zet comment_approved op de STRING 'approved', NIET op '1'.
+     * WP's WP_Comment_Query normaliseert ELKE ingebouwde status:
+     *   - status='approve' → comment_approved='1'
+     *   - status='all'     → comment_approved IN ('0','1')
+     * Beide sluiten Tutor's 'approved'-string uit → 0 reviews, ook op cursussen
+     * met tientallen ratings. Daarom een DIRECTE $wpdb-query (net als Tutor zelf
+     * doet) met comment_approved IN ('approved','1') — geen WP-status-normalisatie.
+     */
+    private static function get_course_reviews( int $course_id ): array {
+        global $wpdb;
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT c.comment_ID, c.comment_author, c.comment_author_email, c.comment_content, c.comment_date,
+                    cm.meta_value AS rating
+             FROM {$wpdb->comments} c
+             LEFT JOIN {$wpdb->commentmeta} cm
+                    ON cm.comment_id = c.comment_ID AND cm.meta_key = 'tutor_rating'
+             WHERE c.comment_post_ID = %d
+               AND c.comment_type = 'tutor_course_rating'
+               AND c.comment_approved IN ('approved', '1')
+             ORDER BY c.comment_date DESC
+             LIMIT 1000",
+            $course_id
+        ) );
+
+        $items = [];
+        foreach ( (array) $rows as $r ) {
+            $rating = (int) $r->rating;
+            $body   = trim( wp_strip_all_tags( $r->comment_content ) );
+            if ( $rating < 1 || $body === '' ) {
+                continue;
+            }
+            $items[] = [
+                'id'        => (int) $r->comment_ID,
+                'author'    => $r->comment_author,
+                'email'     => $r->comment_author_email ?: null,
+                'rating'    => min( 5, max( 1, $rating ) ),
+                'title'     => null,
+                'body'      => $body,
+                'verified'  => true, // Tutor-cursisten zijn per definitie ingeschreven
+                'createdAt' => $r->comment_date,
             ];
         }
 
@@ -2537,6 +2711,63 @@ class NWWS_Migrator_API {
             'ok'         => true,
             'order_id'   => $order_id,
             'status_key' => $status_key,
+        ] );
+    }
+
+    /**
+     * POST /orders/{id}/complete — zet een WC-order op de kern-status 'completed'.
+     *
+     * Bestaansreden: de wc/v3 REST-PUT vanuit Neuramerce wordt bij sommige hosts
+     * (Cloudflare/Kinsta WAF) geweigerd met rest_no_route. Deze route draait als
+     * PHP binnen WordPress en omzeilt de edge-blokkade. Idempotent: een order die
+     * al 'completed' is geeft gewoon ok terug.
+     *
+     * Body: { status?: 'completed', tracking_number?, tracking_carrier?, note? }
+     */
+    public static function complete_order( WP_REST_Request $req ) {
+        $order_id = absint( $req->get_param( 'id' ) );
+        $body     = $req->get_json_params();
+        if ( ! is_array( $body ) ) {
+            $body = [];
+        }
+
+        $order = wc_get_order( $order_id );
+        if ( ! $order ) {
+            return new WP_Error( 'not_found', 'Order niet gevonden', [ 'status' => 404 ] );
+        }
+
+        // Alleen kern-statussen toestaan die 'verzonden/afgerond' betekenen —
+        // voorkomt dat deze route misbruikt wordt om willekeurige statussen te zetten.
+        $status = isset( $body['status'] ) ? sanitize_key( (string) $body['status'] ) : 'completed';
+        if ( ! in_array( $status, [ 'completed', 'processing' ], true ) ) {
+            return new WP_Error( 'invalid_status', "Alleen 'completed' of 'processing' toegestaan", [ 'status' => 400 ] );
+        }
+
+        $tracking_number  = isset( $body['tracking_number'] )  ? sanitize_text_field( (string) $body['tracking_number'] )  : '';
+        $tracking_carrier = isset( $body['tracking_carrier'] ) ? sanitize_text_field( (string) $body['tracking_carrier'] ) : '';
+        $note             = isset( $body['note'] )             ? sanitize_text_field( (string) $body['note'] )             : '';
+
+        if ( $tracking_number !== '' ) {
+            $order->update_meta_data( '_tracking_number', $tracking_number );
+        }
+        if ( $tracking_carrier !== '' ) {
+            $order->update_meta_data( '_tracking_carrier', $tracking_carrier );
+        }
+
+        $already = $order->has_status( $status );
+        if ( ! $already ) {
+            $order->set_status( $status, $note !== '' ? $note : 'Verzonden via Neuramerce' );
+        } elseif ( $note !== '' ) {
+            $order->add_order_note( $note );
+        }
+
+        $order->save();
+
+        return new WP_REST_Response( [
+            'ok'          => true,
+            'order_id'    => $order_id,
+            'status'      => $order->get_status(),
+            'was_already' => $already,
         ] );
     }
 

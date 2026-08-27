@@ -4,7 +4,7 @@ declare(strict_types=1);
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.14.2
+ * Version:      1.16.1
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -17,7 +17,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.14.2');
+define('NWWS_VERSION',    '1.16.1');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -536,6 +536,28 @@ JS;
         );
         wp_enqueue_script('neuramerce-track');
         wp_add_inline_script('neuramerce-track', $before_inline, 'before');
+
+        // Ingelogde klant? Koppel z'n e-mail vroeg via NauraTrack.identify zodat
+        // óók pre-purchase touch-events (ad-landings) de e-mail dragen — basis voor
+        // cross-device attributie. De server hasht de e-mail (SHA-256) en bewaart
+        // alleen de hash; consent-gating zit in track.js (identify zet lokaal, events
+        // sturen pas na toestemming).
+        if (is_user_logged_in()) {
+            $current_email = (string) wp_get_current_user()->user_email;
+            if ($current_email !== '' && is_email($current_email)) {
+                $email_js = wp_json_encode($current_email);
+                $identify_inline = <<<JS
+(function nmrcIdentify() {
+  if (window.NauraTrack && window.NauraTrack.identify) {
+    window.NauraTrack.identify({$email_js});
+  } else {
+    setTimeout(nmrcIdentify, 200);
+  }
+})();
+JS;
+                wp_add_inline_script('neuramerce-track', $identify_inline, 'after');
+            }
+        }
     }
 
     /**
@@ -554,12 +576,15 @@ JS;
         $order_id_js = wp_json_encode((string) $order_id);
         $value_js    = wp_json_encode((float) $order->get_total());
         $currency_js = wp_json_encode($order->get_currency());
+        // E-mail meesturen voor cross-device attributie: de server hasht het
+        // (SHA-256) naar hashedEmail — de raw e-mail wordt niet opgeslagen.
+        $email_js    = wp_json_encode((string) $order->get_billing_email());
 
         // Wacht tot track.js geladen is, dan stuur purchase event
         echo "<script>
 (function waitForTrack() {
   if (window.NauraTrack && window.NauraTrack.purchase) {
-    window.NauraTrack.purchase({$order_id_js}, {$value_js}, {$currency_js});
+    window.NauraTrack.purchase({$order_id_js}, {$value_js}, {$currency_js}, {$email_js});
   } else {
     setTimeout(waitForTrack, 200);
   }
@@ -840,6 +865,16 @@ JS;
             update_option('nwws_chat_enabled', '1'); // auto-enable widget zodra inbox key beschikbaar is
         }
         if ($tracking_token) update_option('nwws_tracking_token', $tracking_token);
+
+        // Auto-configureer de order/voorraad-sync. Neuramerce stuurt de push-URL, push-key
+        // en workspace-ID mee zodat de 60s-cron + real-time push direct na koppelen werken,
+        // zonder dat de gebruiker de Webhook-velden handmatig hoeft te vullen.
+        $push_url     = !empty($config['pushUrl'])     ? esc_url_raw($config['pushUrl'])             : null;
+        $push_key     = !empty($config['pushKey'])     ? sanitize_text_field($config['pushKey'])     : null;
+        $workspace_id = !empty($config['workspaceId']) ? sanitize_text_field($config['workspaceId']) : null;
+        if ($push_url)     update_option('nwws_push_url', $push_url);
+        if ($push_key)     update_option('nwws_push_key', $push_key);
+        if ($workspace_id) update_option('nwws_workspace_id', $workspace_id);
 
         $status = ($inbox_key !== null) ? 'ok_configured' : 'ok_no_inbox';
         update_option('nwws_config_fetch_status', $status);
@@ -1849,6 +1884,11 @@ JS;
         check_ajax_referer('nwws_nonce', 'nonce');
         set_time_limit(300);
 
+        // Eerlijk: zonder push-configuratie kan er niets verstuurd worden — dan geen valse succesmelding.
+        if (empty(get_option('nwws_api_url')) || (empty(get_option('nwws_push_key')) && empty(get_option('nwws_api_key')))) {
+            wp_send_json_error('Synchronisatie is nog niet geconfigureerd. Koppel WooCommerce eenmalig via Neuramerce → Instellingen → Koppelingen; daarna worden de sync-instellingen automatisch ingevuld.');
+        }
+
         $page = 1; $batch = 50; $count = 0;
         do {
             $products = wc_get_products(['limit' => $batch, 'page' => $page, 'status' => 'publish']);
@@ -1860,12 +1900,18 @@ JS;
         } while (count($products) === $batch);
 
         $this->append_sync_log('Producten', $count, []);
-        wp_send_json_success($count . ' producten gesynchroniseerd.');
+        // Eerlijk: producten lopen via de /push-achtergrond-sync (60s-cron), niet via deze knop direct.
+        wp_send_json_success($count . ' producten klaargezet. De volledige productsync verloopt via de automatische achtergrond-sync van Neuramerce — controleer je productcatalogus daar.');
     }
 
     public function ajax_sync_all_orders(): void {
         check_ajax_referer('nwws_nonce', 'nonce');
         set_time_limit(300);
+
+        // Eerlijk: zonder push-configuratie kan er niets verstuurd worden — dan geen valse succesmelding.
+        if (empty(get_option('nwws_api_url')) || (empty(get_option('nwws_push_key')) && empty(get_option('nwws_api_key')))) {
+            wp_send_json_error('Synchronisatie is nog niet geconfigureerd. Koppel WooCommerce eenmalig via Neuramerce → Instellingen → Koppelingen; daarna worden de sync-instellingen automatisch ingevuld.');
+        }
 
         $page = 1; $batch = 50; $count = 0;
         do {
@@ -1878,7 +1924,8 @@ JS;
         } while (count($orders) === $batch);
 
         $this->append_sync_log('Orders', $count, []);
-        wp_send_json_success($count . ' orders gesynchroniseerd.');
+        // Eerlijk: de push is fire-and-forget, dus 'verstuurd' (niet 'bevestigd'). Resultaat staat in Neuramerce.
+        wp_send_json_success($count . ' orders verstuurd naar Neuramerce. De verwerking volgt — controleer het orderoverzicht in Neuramerce.');
     }
 
     /**
@@ -1972,14 +2019,27 @@ JS;
 
     private function send_to_api(string $endpoint, array $data, string $method = 'POST'): bool {
         $api_url = get_option('nwws_api_url', '');
-        // nwws_push_key is the HMAC-derived key validated by the Next.js app.
-        // nwws_api_key is a legacy field; prefer push_key with fallback.
-        $api_key = get_option('nwws_push_key', '') ?: get_option('nwws_api_key', '');
+        // Sleutelkeuze — beide zijn HMAC-afgeleide sleutels die de Next.js app
+        // accepteert (findWorkspaceByPluginKey/resolvePluginKey):
+        //   - nwws_api_key  = CONNECTION-scoped (deriveConnectionSecret(connectionId))
+        //   - nwws_push_key = WORKSPACE-scoped  (deriveKey(workspaceId))
+        // Voor de order-push MOET de connection-scoped sleutel mee, anders kan de app
+        // bij >1 WooCommerce-koppeling (bv. Nomad + Qandyshop) niet bepalen uit wélke
+        // winkel de order komt → order werd een wees. Andere endpoints (products/
+        // conversions) blijven op push_key. Fallback beschermt legacy-installs.
+        $api_key = ($endpoint === 'orders')
+            ? (get_option('nwws_api_key', '') ?: get_option('nwws_push_key', ''))
+            : (get_option('nwws_push_key', '') ?: get_option('nwws_api_key', ''));
 
         if (empty($api_url) || empty($api_key)) return false;
 
+        // 'orders' verhuisde naar het canonieke v1-pad (/api/v1/orders — publiek + WooOrder-upsert
+        // via findWorkspaceByPluginKey). Zonder de v1-prefix landde de push op /api/orders → proxy-401,
+        // waardoor real-time order-sync stilletjes faalde. Overige endpoints lopen via de /push-cron.
+        $path = ($endpoint === 'orders') ? 'v1/orders' : $endpoint;
+
         // Non-blocking: fire-and-forget so checkout/save actions are never delayed.
-        wp_remote_request(trailingslashit($api_url) . $endpoint, [
+        wp_remote_request(trailingslashit($api_url) . $path, [
             'method'   => $method,
             'headers'  => ['Content-Type' => 'application/json', 'X-API-Key' => $api_key],
             'body'     => wp_json_encode($data),

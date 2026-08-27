@@ -1,15 +1,78 @@
 # Changelog — Neura WooCommerce Sync
 
-## [1.14.2] - 2026-08-27
+## [1.16.1] — 2026-08-27
+
+Consolidatierelease: dit distributierepo en de kopie in saas-frontend waren uiteengelopen. Deze release bevat alle wijzigingen t/m saas-frontend v1.16.0 én de WOWT-fix die alleen hier zat. (Nummering: dist-releases 1.14.1 en 1.14.2 kwamen inhoudelijk overeen met resp. 1.15.2 en de WOWT-fix hieronder.)
 
 ### Fixed
-- **`/order-statuses` registreerde met methods `"WOWT"`**: de dual-method "review-fix" uit v1.11.0 deed `WP_REST_Server::READABLE | WP_REST_Server::CREATABLE`, maar dat zijn strings ('GET', 'POST') en PHP's bitwise `|` maakt daar tekenreeks "WOWT" van. Gevolg: elke GET/POST op `/order-statuses` gaf `rest_no_route` (gemeten op nomadfire.shop), waardoor Neura de custom statussenlijst nooit kon pushen en elke per-order statuspush daarna met `unknown_status` faalde. Nu een array `['GET','POST']`.
+- **`/order-statuses` registreerde met methods `"WOWT"`** — `WP_REST_Server::READABLE | WP_REST_Server::CREATABLE` zijn strings ('GET', 'POST'); PHP's bitwise `|` maakt daar "WOWT" van, waardoor élke GET/POST op `/order-statuses` `rest_no_route` gaf (gemeten op nomadfire.shop). Neura kon daardoor de custom statussenlijst nooit pushen en elke per-order statuspush faalde met `unknown_status`. Nu een array `['GET','POST']`.
 
-## [1.14.1] — 2026-07-06
+## [1.16.0] — 2026-07-29
 
 ### Added
-- **Tutor LMS course-export verrijkt** — `/wp-json/neuramerce/v1/courses` levert nu per les een canonieke `videoUrl` (uit `_video`-meta: YouTube/Vimeo/extern/HTML5), gratis-preview-vlag (`_is_preview`), en quizvragen+antwoorden (`tutor_quiz`-posts + `tutor_quiz_questions`/`tutor_quiz_question_answers`-tabellen). Course-niveau: `requirements`, `outcomes` (uit `_tutor_course_benefits`), `language`, en `enrollments` (uit `tutor_enrolled`, incl. status).
-- **Cursussen-admintab** — telling (cursussen/onderwerpen/lessen/quizzen) + endpoint-URL + API-key-status.
+- **`POST /orders/{id}/complete` bypass-endpoint** — voltooit een order rechtstreeks via de plugin (HPOS-compatibel), voor fulfillment-flows waar de reguliere statuspush niet volstaat.
+- **`meta.features` capability-advertentie** — de plugin adverteert nu welke features hij ondersteunt, zodat Neura per shop weet welke endpoints beschikbaar zijn.
+- **`connectionId` op de shipment-webhook** — zodat Neura bij meerdere WooCommerce-koppelingen in één werkruimte de shipment aan de juiste winkel koppelt.
+
+## [1.15.8] — 2026-07-28
+
+### Fixed
+- **Omschrijvingen behouden HTML-structuur bij import** — `/terms` endpoint en de product-categorieën-handler gebruikten `wp_strip_all_tags()` om omschrijvingen te saniteren. Dit verwijdert tags zonder spaties in te voegen, waardoor tabellen en FAQ-teksten samenvloeien ("MaatPersonenBeste voorSmall", "kamado?Significant"). Vervangen door `wp_kses_post()` dat veilige opmaak (alinea's, koppen, lijsten, tabellen) behoudt en alleen gevaarlijke tags verwijdert. Na her-import zijn rijke omschrijvingen volledig correct overgenomen.
+
+## [1.15.7] — 2026-07-07
+
+### Fixed
+- **Cursus-reviews werden nóg steeds niet gevonden (0)** — vervolg op 1.15.6. WordPress' `WP_Comment_Query` normaliseert élke ingebouwde status: `status='approve'` → `comment_approved='1'`, en `status='all'` → `comment_approved IN ('0','1')`. Tutor slaat de status op als de STRING `'approved'` → beide sluiten hem uit. Nu een **directe `$wpdb`-query** (zoals Tutor zelf doet) met `comment_approved IN ('approved','1')` — geen WP-status-normalisatie meer. Geverifieerd tegen WordPress core (`class-wp-comment-query.php`).
+
+## [1.15.6] — 2026-07-07
+
+### Fixed
+- **Cursus-reviews werden niet geëxporteerd (0 gevonden)** — Tutor slaat de goedkeur-status van een course-rating op als de STRING `comment_approved = 'approved'`, niet als `'1'`. De export gebruikte `get_comments( status => 'approve' )`, wat WordPress vertaalt naar `comment_approved = '1'` → 0 resultaten, óók op cursussen met tientallen reviews. Nu wordt `status = all` opgehaald en filteren we zelf op `'approved'`/`'1'` (spam/trash/hold vallen af). Verifieerd tegen de Tutor-bron (`themeum/tutor` `classes/Reviews.php`: `comment_type = tutor_course_rating`, `comment_agent = TutorLMSPlugin`, meta `tutor_rating`).
+
+## [1.15.5] — 2026-07-07
+
+### Added
+- **Cursus-reviews in de course-export** — `get_courses` geeft nu per cursus een `reviews`-array mee: Tutor-course-ratings (WP-comments `comment_type = tutor_course_rating` op de cursus, score uit comment-meta `tutor_rating`, alleen goedgekeurd). Voedt de nieuwe Neura `ReviewCourse`-import → reviews-module + de reviews-drawer/featured-carousel op de storefront-cursuspagina.
+
+## [1.15.4] — 2026-07-06
+
+### Added / Fixed
+- **Quiz-export: échte "meerdere antwoorden mogelijk"-vlag** — `get_quiz_payload` las alleen `question_type`, maar Tutor slaat élke keuzevraag op als `multiple_choice`; of er meerdere antwoorden juist mogen zijn staat in `question_settings.has_multiple_correct_answer` (de "Meervoudig juist antwoord"-toggle). Deze wordt nu per vraag meegegeven als `multipleCorrect`, plus `answerRequired`, `randomize` en `explanation` (antwoord-uitleg). Voorheen leidde Neura enkel/meervoudig af uit het type → toonde "meerdere antwoorden mogelijk" bij ELKE vraag.
+- **Quiz-brede instellingen meegenomen** — `settings{attemptsAllowed, timeLimitValue/Unit, feedbackMode, questionsOrder, maxQuestionsToAnswer}` uit `tutor_quiz_option` (nog niet afgedwongen in de speler; meegenomen zodat latere uitbreiding geen her-import vraagt).
+
+## [1.15.3] — 2026-07-06
+
+### Fixed
+- **Kritieke bug: bijna alle lesinhoud ontbrak bij courses-export** — `get_courses` haalde lessen op met `post_parent = cursus-ID`, maar Tutor LMS hangt lessen aan hun **topic** (sectie), niet rechtstreeks aan de cursus. Resultaat: van elke cursus met secties (de norm) kwamen alléén de quizvragen mee; alle echte lessen (tekst/video) werden stil overgeslagen. Nu: topics eerst ophalen, lessen via `post_parent__in` op de topic-ID's (+ fallback op de cursus-ID zelf voor oude cursussen zonder secties).
+- **Cursus-instellingen (duur/niveau/vereisten/uitkomsten) kwamen vaak leeg mee** — Tutor slaat deze soms op als losse meta-key, maar vaak alléén genest in `_tutor_course_settings` (en `benefits`/`requirements` soms als array, soms als newline-tekst). Beide vormen worden nu geprobeerd.
+- **Prijs stond op 0 bij WooCommerce-gekoppelde cursussen** — als de losse Tutor-prijsmeta leeg is en de cursus niet expliciet op "gratis" staat, wordt de prijs nu opgehaald van het gekoppelde WooCommerce-product.
+- **Niveau "Expert" kwam leeg over in Neura** — Tutor gebruikt `expert`, Neura's editor verwacht `advanced`; vertaling zit nu in de app-import (`wp-import.ts`).
+
+### Added
+- **Opdrachten (`tutor_assignments`) worden nu ook meegenomen** — als de Assignments-addon actief is, komen opdrachten mee als tekstles (was eerder volledig genegeerd).
+
+## [1.15.2] — 2026-07-06
+
+### Added
+- **Tutor LMS course-export verrijkt** — `/wp-json/neuramerce/v1/courses`: per-les `videoUrl` (uit `_video`), gratis-preview (`_is_preview`), quizvragen+antwoorden (`tutor_quiz`-posts + `tutor_quiz_questions`/`_answers`-tabellen), inschrijvingen (`tutor_enrolled`), en course `requirements`/`outcomes`/`language`. Nieuwe **Cursussen-admintab** (telling + endpoint + API-key-status).
+
+## [1.15.1] — 2026-07-03
+
+### Fixed
+- **Order-push koppelt nu aan de juiste winkel (multi-shop fix)** — de real-time order-push stuurde de workspace-brede sleutel (`nwws_push_key`) mee, waarmee Neuramerce bij meerdere WooCommerce-koppelingen in één werkruimte (bv. Nomad + Qandyshop) niet kon bepalen uit wélke winkel een bestelling kwam → de order werd een "wees" (of belandde op de verkeerde winkel-tab). De order-push gebruikt nu de koppeling-specifieke sleutel (`nwws_api_key` = `deriveConnectionSecret(connectionId)`), zodat Neuramerce de bestelling meteen aan de juiste winkel toewijst. Andere sync-endpoints (producten/conversies) blijven ongewijzigd op `nwws_push_key`; legacy-installaties vallen automatisch terug (geen regressie).
+
+## [1.15.0] — 2026-06-30
+
+### Added
+- **Cross-device attributie voor ingelogde klanten** — als een bezoeker ingelogd is, koppelt de plugin z'n e-mail nu vroeg via `NauraTrack.identify()` (in de `<head>`, na track.js). Daardoor dragen óók pre-purchase touch-events (ad-landings) de e-mail, waarmee Neura touchpoints van hetzelfde persoon over verschillende apparaten kan samenvoegen. De server hasht de e-mail (SHA-256) en bewaart alleen de hash; consent-gating zit in track.js (identify zet alleen lokaal, events versturen pas na toestemming). Vult aan op de al bestaande e-mail-meegave bij het `purchase`-event op de bedankt-pagina.
+
+## [1.14.0] — 2026-06-24
+
+### Added
+- **Auto-configuratie van de order/voorraad-sync** — na het koppelen haalt de plugin via `workspace-config` nu ook de push-URL, push-key en workspace-ID op en slaat die op (`nwws_push_url` / `nwws_push_key` / `nwws_workspace_id`). De 60s-sync-cron én real-time push werken daardoor direct na koppelen, zónder dat de Webhook-velden handmatig gekopieerd hoeven te worden.
+
+### Fixed
+- **Eerlijke sync-statusmelding (geen valse succesmelding)** — "Sync Alle Orders/Producten" meldde altijd succes, óók als er door ontbrekende push-configuratie niets verstuurd werd. Nu: een duidelijke foutmelding als de sync nog niet geconfigureerd is, en anders "X verstuurd naar Neuramerce — verwerking volgt" i.p.v. een misleidend "gesynchroniseerd".
 
 ## [1.11.1] — 2026-05-23
 
