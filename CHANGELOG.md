@@ -1,5 +1,13 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.16.2] — 2026-09-15
+
+### Fixed
+- **`/recipes` gaf vanaf pagina 2 niets terug** (gemeten op nomadfire.shop: pagina 1 meldde 15 pagina's, pagina 2 een lege lijst met `pages: 1`, bij 10, 20 en 50 per pagina). Paginering loopt nu via `paged` met een vaste `orderby` in plaats van `offset`.
+
+### Added
+- **`/recipes?ids=1,2,3`**: haalt precies die recepten op (max 50, volgorde van de lijst). Neura gebruikt dit bij een import met pre-selectie, zodat paginering daar niet meer nodig is.
+
 ## [1.16.1] — 2026-08-27
 
 Consolidatierelease: dit distributierepo en de kopie in saas-frontend waren uiteengelopen. Deze release bevat alle wijzigingen t/m saas-frontend v1.16.0 én de WOWT-fix die alleen hier zat. (Nummering: dist-releases 1.14.1 en 1.14.2 kwamen inhoudelijk overeen met resp. 1.15.2 en de WOWT-fix hieronder.)

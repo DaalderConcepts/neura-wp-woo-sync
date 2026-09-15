@@ -1414,18 +1414,30 @@ class NWWS_Migrator_API {
 
         $page   = max( 1, (int) $req->get_param( 'page' ) ?: 1 );
         $per    = min( 50, max( 1, (int) $req->get_param( 'per_page' ) ?: 20 ) );
-        $offset = ( $page - 1 ) * $per;
+        // v1.16.2: `ids` (komma-lijst post-ID's, max 50) haalt precies die recepten op.
+        // Op nomadfire.shop gaf offset-paginering vanaf pagina 2 niets terug, terwijl
+        // Neura de gewenste recepten al kent: zo is paginering niet meer nodig.
+        $ids = array_slice( array_values( array_filter( array_map( 'absint', explode( ',', (string) $req->get_param( 'ids' ) ) ) ) ), 0, 50 );
 
         $prev_lang = self::wpml_switch_to_nl();
 
-        $query = new WP_Query( [
+        $args = [
             'post_type'           => 'wpzoom_rcb',
             'post_status'         => 'publish',
-            'posts_per_page'      => $per,
-            'offset'              => $offset,
             'suppress_filters'    => false,
             'ignore_sticky_posts' => true,
-        ] );
+        ];
+        if ( $ids ) {
+            $args['post__in']       = $ids;
+            $args['orderby']        = 'post__in';
+            $args['posts_per_page'] = count( $ids );
+        } else {
+            $args['posts_per_page'] = $per;
+            $args['paged']          = $page;
+            $args['orderby']        = 'date';
+            $args['order']          = 'DESC';
+        }
+        $query = new WP_Query( $args );
 
         $total = $query->found_posts;
 
