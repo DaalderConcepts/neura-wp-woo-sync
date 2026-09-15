@@ -1,5 +1,10 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.16.3] — 2026-09-15
+
+### Fixed
+- **`/recipes` gaf een lege titel als de WPZOOM-kaarttitel niet was ingevuld.** WPZOOM bewaart die als `""`, en de terugval op de posttitel reageerde alleen op `null`. Neura slaat een recept zonder titel stil over: op nomadfire.shop vielen zo 3 van de 64 recepten weg.
+
 ## [1.16.2] — 2026-09-15
 
 ### Fixed

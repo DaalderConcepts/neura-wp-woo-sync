@@ -1447,7 +1447,9 @@ class NWWS_Migrator_API {
             return [
                 'id'          => $post->ID,
                 'slug'        => $post->post_name,
-                'title'       => $recipe['title']   ?? $post->post_title,
+                // `?:` en niet `??`: WPZOOM bewaart een niet-ingevulde kaarttitel als "", en
+                // Neura slaat een recept met lege titel stil over.
+                'title'       => ( $recipe['title'] ?? '' ) ?: $post->post_title,
                 'summary'     => $recipe['summary']  ?? null,
                 'course'      => $recipe['course']   ?? [],
                 'cuisine'     => $recipe['cuisine']  ?? [],
