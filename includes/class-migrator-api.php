@@ -2398,6 +2398,17 @@ class NWWS_Migrator_API {
         // klant terug. Hier het logged_in-cookie zelf valideren. Veilig voor een GET die
         // alleen leest: zonder Access-Control-Allow-Origin kan een andere site het
         // antwoord niet lezen, en SameSite-cookies gaan cross-site niet mee.
+        //
+        // Juist omdat de nonce-toets van WordPress hier niet meer beschermt: alleen
+        // same-origin. WP-REST beantwoordt ook JSONP (?_jsonp=), en een <script>-tag
+        // op een andere site zou dan adres en token kunnen uitlezen als de browser
+        // het cookie meestuurt. Sec-Fetch-Site sturen alle moderne browsers mee;
+        // ontbreekt hij (oude browser, server-naar-server), dan beslist het cookie.
+        $fetch_site = (string) $req->get_header( 'sec_fetch_site' );
+        if ( null !== $req->get_param( '_jsonp' ) || ( '' !== $fetch_site && 'same-origin' !== $fetch_site ) ) {
+            return self::current_customer_response( [ 'loggedIn' => false ] );
+        }
+
         $user_id = wp_validate_auth_cookie( '', 'logged_in' );
         $user    = $user_id ? get_userdata( $user_id ) : false;
         if ( ! $user ) {
