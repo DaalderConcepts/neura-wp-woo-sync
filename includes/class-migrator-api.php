@@ -2392,28 +2392,87 @@ class NWWS_Migrator_API {
     // ─── Current customer (publiek, via WP sessie) ────────────────────────────
 
     public static function get_current_customer( WP_REST_Request $req ): WP_REST_Response {
-        if ( ! is_user_logged_in() ) {
-            return new WP_REST_Response( [ 'loggedIn' => false ], 200 );
+        // Niet is_user_logged_in(): de widget-loader roept dit aan zonder X-WP-Nonce, en
+        // WordPress zet de gebruiker van zo'n REST-request dan op 0
+        // (rest_cookie_check_errors). Dit endpoint gaf daardoor nooit een ingelogde
+        // klant terug. Hier het logged_in-cookie zelf valideren. Veilig voor een GET die
+        // alleen leest: zonder Access-Control-Allow-Origin kan een andere site het
+        // antwoord niet lezen, en SameSite-cookies gaan cross-site niet mee.
+        $user_id = wp_validate_auth_cookie( '', 'logged_in' );
+        $user    = $user_id ? get_userdata( $user_id ) : false;
+        if ( ! $user ) {
+            return self::current_customer_response( [ 'loggedIn' => false ] );
         }
 
-        $user = wp_get_current_user();
         // Prefer first + last name (personal), fall back to display_name (often company), then login
         $name = trim( ( $user->first_name ?? '' ) . ' ' . ( $user->last_name ?? '' ) );
         if ( ! $name ) {
             $name = trim( $user->display_name ?? '' );
         }
 
-        $response = new WP_REST_Response( [
+        $email = sanitize_email( $user->user_email ?? '' );
+        $data  = [
             'loggedIn' => true,
-            'email'    => sanitize_email( $user->user_email ?? '' ),
+            'email'    => $email,
             'name'     => esc_html( $name ?: $user->user_login ),
-        ], 200 );
+        ];
 
-        // Sta cross-origin toe (widget draait als iframe van Neuramerce domein)
-        $response->header( 'Access-Control-Allow-Origin',  '*' );
-        $response->header( 'Access-Control-Allow-Methods', 'GET' );
+        // Zelfde sanering als bij het inbedden van de widget (enqueue_frontend_assets):
+        // de token moet exact de sleutel binden die de loader naar Neura stuurt.
+        $token = self::chat_identity_token( sanitize_text_field( (string) get_option( 'nwws_chat_inbox_key', '' ) ), $email );
+        if ( $token ) {
+            $data['identityToken'] = $token;
+        }
 
+        return self::current_customer_response( $data );
+    }
+
+    /**
+     * Antwoord van current-customer: nooit gecachet (het hangt af van wie er
+     * ingelogd is en draagt een token), en bewust zonder CORS-header. De
+     * widget-loader vraagt dit same-origin op.
+     */
+    private static function current_customer_response( array $data ): WP_REST_Response {
+        $response = new WP_REST_Response( $data, 200 );
+        $response->header( 'Cache-Control', 'private, no-store, max-age=0' );
+        $response->header( 'Vary', 'Cookie' );
         return $response;
+    }
+
+    /**
+     * Chat-identiteitstoken voor Neura: bewijst tegenover de chat-routes dat dit
+     * e-mailadres van de ingelogde klant is, en niet door een bezoeker is ingetypt.
+     * Zonder token behandelt Neura het adres als opgegeven, niet als klantidentiteit.
+     *
+     * Formaat (moet exact overeenkomen met src/lib/modules/inbox/chat-identity-token.ts
+     * in de app, inclusief de testvector daar):
+     *   payload     = base64url( JSON { k: widget-sleutel, e: e-mail lowercase, x: verloop } )
+     *   signing_key = HMAC-SHA256( key = API-key, msg = "neura-chat-identity-wp-v1" )   (raw)
+     *   sig         = base64url( HMAC-SHA256( key = signing_key, msg = "chat-identity:wp1:" . payload ) )
+     *   token       = "wp1." . payload . "." . sig
+     *
+     * De API-key is dezelfde die de merchant in Neura als WordPress-sync-sleutel invult.
+     * Er wordt niet met die key zelf getekend: hij is ook het Bearer-token voor de
+     * plugin-API, en een handtekening mag nooit als die key bruikbaar zijn.
+     */
+    public static function chat_identity_token( string $widget_key, string $email, ?int $expires = null, ?string $api_key = null ): ?string {
+        // $expires en $api_key alleen voor tests/chat-identity-token-vector.php.
+        $api_key = $api_key ?? (string) get_option( NWWS_Migrator_Auth::OPTION_KEY, '' );
+        $email   = strtolower( trim( $email ) );
+        if ( '' === $widget_key || strlen( $api_key ) < 32 || ! is_email( $email ) ) {
+            return null;
+        }
+
+        $expires     = $expires ?? time() + HOUR_IN_SECONDS;
+        $payload     = self::base64url( (string) wp_json_encode( [ 'k' => $widget_key, 'e' => $email, 'x' => $expires ] ) );
+        $signing_key = hash_hmac( 'sha256', 'neura-chat-identity-wp-v1', $api_key, true );
+        $sig         = self::base64url( hash_hmac( 'sha256', 'chat-identity:wp1:' . $payload, $signing_key, true ) );
+
+        return 'wp1.' . $payload . '.' . $sig;
+    }
+
+    private static function base64url( string $raw ): string {
+        return rtrim( strtr( base64_encode( $raw ), '+/', '-_' ), '=' );
     }
 
     /**
