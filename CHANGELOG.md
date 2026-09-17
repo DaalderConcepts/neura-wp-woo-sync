@@ -1,5 +1,14 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.17.0] — 2026-09-17
+
+### Added
+- **`/current-customer` geeft een `identityToken` mee** voor de ingelogde klant. Neura behandelt het e-mailadres uit de chatwidget alleen als klantidentiteit met zo'n token (orders in het contactpaneel, offline-follow-up, koppeling in Live Bezoekers). Getekend met een van de plugin-API-key afgeleide sleutel, gebonden aan de widget-sleutel (`nwws_chat_inbox_key`), het adres en een verloop van een uur. Werkt alleen als de inbox in Neura dezelfde API-key als WordPress-sync-sleutel heeft. Testvector: `php tests/chat-identity-token-vector.php`.
+
+### Fixed
+- **`/current-customer` gaf nooit een ingelogde klant terug.** De widget-loader roept het aan zonder `X-WP-Nonce`, en WordPress zet de gebruiker van zo'n REST-request dan op 0. Het endpoint valideert het `logged_in`-cookie nu zelf.
+- **`/current-customer` wordt niet meer gecachet** (`Cache-Control: private, no-store`, `Vary: Cookie`) en stuurt geen `Access-Control-Allow-Origin: *` meer: de widget-loader vraagt het same-origin op. JSONP (`?_jsonp=`) en cross-site requests (`Sec-Fetch-Site` anders dan `same-origin`) krijgen `loggedIn: false`.
+
 ## [1.16.3] — 2026-09-15
 
 ### Fixed
