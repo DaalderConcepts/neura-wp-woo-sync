@@ -1136,8 +1136,13 @@ class NWWS_Migrator_API {
         ] );
         $total = count_users()['avail_roles']['customer'] ?? 0;
 
-        $data = array_map( function( WP_User $u ) {
-            return [
+        // Alleen op expliciete vraag, en alleen voor klantrollen (get_users hierboven):
+        // Neuramerce neemt de hash over zodat klanten na de migratie met hun oude
+        // wachtwoord kunnen inloggen. Achter dezelfde API-sleutel als de rest van de route.
+        $with_hash = $req->get_param( 'include_password_hash' ) === '1';
+
+        $data = array_map( function( WP_User $u ) use ( $with_hash ) {
+            $row = [
                 'id'        => $u->ID,
                 'email'     => $u->user_email,
                 'firstName' => get_user_meta( $u->ID, 'first_name', true ),
@@ -1151,6 +1156,13 @@ class NWWS_Migrator_API {
                 ],
                 'createdAt' => $u->user_registered,
             ];
+            // role__in matcht op één rol: een beheerder die óók 'customer' is komt mee.
+            // Diens hash gaat nooit de deur uit.
+            $only_customer_roles = empty( array_diff( (array) $u->roles, [ 'customer', 'subscriber' ] ) );
+            if ( $with_hash && $only_customer_roles ) {
+                $row['passwordHash'] = $u->user_pass;
+            }
+            return $row;
         }, $users );
 
         return new WP_REST_Response( [
