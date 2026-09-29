@@ -1,5 +1,10 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.16.6] — 2026-09-30
+
+### Fixed
+- **Connect stuurt nu ook de migrator-sleutel naar Neura.** Connect zette alleen `nwws_api_key`; de sleutel waarmee Neura importeert (`neuramerce_api_key`) moest met de hand in het dashboard, anders bleef de koppeling op niet-gereed. De plugin stuurt hem nu mee bij Connect, bij een nieuw gegenereerde sleutel en eenmalig bij het openen van de instellingen. Vereist Neura-route `/api/v1/woocommerce/migrator-key`.
+
 ## [1.16.5] — 2026-09-27
 
 ### Fixed
