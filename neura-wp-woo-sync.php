@@ -4,7 +4,7 @@ declare(strict_types=1);
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.16.5
+ * Version:      1.16.6
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -17,7 +17,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.16.5');
+define('NWWS_VERSION',    '1.16.6');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -681,6 +681,7 @@ JS;
                 }
                 echo '<div class="notice notice-' . esc_attr($notice_type) . '"><p>' . wp_kses($notice_msg, ['a' => ['href' => []]]) . '</p></div>';
             }
+            if (!empty($new_api_key) && !empty($new_conn_id)) $this->push_migrator_key(true, true);
             } // einde auto-fetch
 
             echo '<div class="notice notice-success"><p>Instellingen opgeslagen!</p></div>';
@@ -691,6 +692,7 @@ JS;
             $action = sanitize_key($_POST['wcmac_migrator_action']);
             if ($action === 'generate') {
                 update_option('neuramerce_api_key', wp_generate_password(32, false));
+                $this->push_migrator_key(true, false);
                 echo '<div class="notice notice-success"><p>Nieuwe API key gegenereerd.</p></div>';
             } elseif ($action === 'revoke') {
                 delete_option('neuramerce_api_key');
@@ -783,6 +785,7 @@ JS;
 
         // Haal direct workspace config op (inbox key + tracking token + auto-enables chat widget)
         $this->do_fetch_workspace_config($new_api_key, $new_conn_id);
+        $this->push_migrator_key(true, true);
 
         // Sla success flag op in transient zodat het template een inline notice kan tonen
         set_transient('nwws_just_configured', '1', 60);
@@ -803,6 +806,7 @@ JS;
      * Gebruikt een transient zodat het niet bij elke pageload een HTTP request doet.
      */
     private function maybe_auto_fetch_workspace_config(): void {
+        $this->push_migrator_key(false, false);
         $api_key = get_option('nwws_api_key', '');
         $conn_id = get_option('nwws_connection_id', '');
         if (empty($api_key) || empty($conn_id)) return;
@@ -812,6 +816,46 @@ JS;
         if (get_transient('nwws_config_synced')) return;
 
         $this->do_fetch_workspace_config($api_key, $conn_id);
+    }
+
+    /**
+     * Stuurt de migrator-sleutel (neuramerce_api_key) naar Neura. Connect zette alleen de
+     * sleutel richting Neura; de sleutel waarmee Neura bij deze site importeert moest met
+     * de hand terug in het dashboard. Zonder die stap stond de koppeling op niet-gereed.
+     *
+     * $force  = altijd versturen (expliciete Connect of nieuwe sleutel), anders alleen als
+     *           deze sleutel+koppeling nog niet bevestigd is, met 10 minuten rust na een fout.
+     * $create = een sleutel aanmaken als er nog geen is; alleen bij een expliciete Connect,
+     *           nooit bij het passief laden van een pagina.
+     */
+    private function push_migrator_key(bool $force, bool $create): void {
+        $api_key = get_option('nwws_api_key', '');
+        $conn_id = get_option('nwws_connection_id', '');
+        if (empty($api_key) || empty($conn_id)) return;
+
+        $key = NWWS_Migrator_Auth::get();
+        if (empty($key)) {
+            if (!$create) return;
+            $key = wp_generate_password(32, false);
+            update_option('neuramerce_api_key', $key);
+        }
+
+        $sig = md5($key . '|' . $conn_id);
+        if (!$force && (get_option('nwws_migrator_key_pushed', '') === $sig || get_transient('nwws_migrator_push_wait'))) return;
+
+        $api_url  = get_option('nwws_api_url', 'https://app.neuramerce.com/api');
+        $response = wp_remote_post(rtrim($api_url, '/') . '/v1/woocommerce/migrator-key', [
+            'headers' => ['X-Neuramerce-Plugin-Key' => $api_key, 'Content-Type' => 'application/json'],
+            'body'    => wp_json_encode(['connectionId' => $conn_id, 'migratorKey' => $key]),
+            'timeout' => 8,
+        ]);
+
+        if (!is_wp_error($response) && (int) wp_remote_retrieve_response_code($response) === 200) {
+            update_option('nwws_migrator_key_pushed', $sig, false);
+            delete_transient('nwws_migrator_push_wait');
+        } else {
+            set_transient('nwws_migrator_push_wait', '1', 10 * MINUTE_IN_SECONDS);
+        }
     }
 
     /**
