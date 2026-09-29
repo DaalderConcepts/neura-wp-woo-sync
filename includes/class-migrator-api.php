@@ -1127,17 +1127,32 @@ class NWWS_Migrator_API {
         $per    = min( 100, max( 1, (int) $req->get_param( 'per_page' ) ?: 50 ) );
         $offset = ( $page - 1 ) * $per;
 
-        $users = get_users( [
-            'role__in' => [ 'customer', 'subscriber' ],
-            'number'   => $per,
-            'offset'   => $offset,
-            'orderby'  => 'registered',
-            'order'    => 'DESC',
-        ] );
-        $total = count_users()['avail_roles']['customer'] ?? 0;
+        if ( $req->get_param( 'include_password_hash' ) === '1' ) {
+            // Accountmigratie: alle customers plus alleen de subscribers die ooit
+            // bestelden (de rest is meestal nieuwsbrief of spam). Eerst de volledige
+            // id-lijst, dan pagineren en tellen daarover, zodat total en pages kloppen.
+            $ids   = self::migration_customer_ids();
+            $total = count( $ids );
+            $slice = array_slice( $ids, $offset, $per );
+            $users = $slice ? get_users( [ 'include' => $slice, 'orderby' => 'include' ] ) : [];
+        } else {
+            $users = get_users( [
+                'role__in' => [ 'customer', 'subscriber' ],
+                'number'   => $per,
+                'offset'   => $offset,
+                'orderby'  => 'registered',
+                'order'    => 'DESC',
+            ] );
+            $total = count_users()['avail_roles']['customer'] ?? 0;
+        }
 
-        $data = array_map( function( WP_User $u ) {
-            return [
+        // Alleen op expliciete vraag, en alleen voor klantrollen (get_users hierboven):
+        // Neuramerce neemt de hash over zodat klanten na de migratie met hun oude
+        // wachtwoord kunnen inloggen. Achter dezelfde API-sleutel als de rest van de route.
+        $with_hash = $req->get_param( 'include_password_hash' ) === '1';
+
+        $data = array_map( function( WP_User $u ) use ( $with_hash ) {
+            $row = [
                 'id'        => $u->ID,
                 'email'     => $u->user_email,
                 'firstName' => get_user_meta( $u->ID, 'first_name', true ),
@@ -1151,6 +1166,13 @@ class NWWS_Migrator_API {
                 ],
                 'createdAt' => $u->user_registered,
             ];
+            // role__in matcht op één rol: een beheerder die óók 'customer' is komt mee.
+            // Diens hash gaat nooit de deur uit.
+            $only_customer_roles = empty( array_diff( (array) $u->roles, [ 'customer', 'subscriber' ] ) );
+            if ( $with_hash && $only_customer_roles ) {
+                $row['passwordHash'] = $u->user_pass;
+            }
+            return $row;
         }, $users );
 
         return new WP_REST_Response( [
@@ -1160,6 +1182,32 @@ class NWWS_Migrator_API {
             'pages'    => (int) ceil( $total / $per ),
             'items'    => $data,
         ] );
+    }
+
+    /**
+     * Gebruikers-id's voor de accountmigratie, oplopend: rol customer, plus rol
+     * subscriber met minstens één order (HPOS-tabel én klassieke postmeta).
+     */
+    private static function migration_customer_ids(): array {
+        global $wpdb;
+        $customers = get_users( [ 'role' => 'customer', 'fields' => 'ID' ] );
+        $subs      = get_users( [ 'role' => 'subscriber', 'fields' => 'ID' ] );
+
+        $with_orders = [];
+        if ( $subs ) {
+            $in = implode( ',', array_map( 'intval', $subs ) );
+            $hpos = $wpdb->prefix . 'wc_orders';
+            if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $hpos ) ) === $hpos ) {
+                $with_orders = array_merge( $with_orders, $wpdb->get_col( "SELECT DISTINCT customer_id FROM {$hpos} WHERE customer_id IN ({$in})" ) );
+            }
+            $with_orders = array_merge( $with_orders, $wpdb->get_col(
+                "SELECT DISTINCT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_customer_user' AND meta_value IN ({$in})"
+            ) );
+        }
+
+        $ids = array_values( array_unique( array_map( 'intval', array_merge( $customers, $with_orders ) ) ) );
+        sort( $ids );
+        return $ids;
     }
 
     // ─── WooCommerce Reviews ──────────────────────────────────────────────────

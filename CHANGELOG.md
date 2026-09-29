@@ -1,5 +1,15 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.16.5] — 2026-09-27
+
+### Fixed
+- **`/customers?include_password_hash=1` stopte na het aantal customers.** `total` en `pages` telden alleen de rol customer terwijl de lijst ook subscribers bevatte, dus de import miste de rest (Nomad Fire: 2.200 van 3.144). In deze modus geeft de route nu alle customers plus alleen de subscribers met minstens één order (HPOS en postmeta), en telt daarover.
+
+## [1.16.4] — 2026-09-27
+
+### Added
+- **`/customers?include_password_hash=1` geeft per klant `passwordHash` mee** (de ongewijzigde `user_pass`). Neura importeert die met `import_woo_customers`, zodat klanten na een migratie met hun oude WordPress-wachtwoord kunnen inloggen; bij de eerste login zet Neura het om naar bcrypt. Alleen op expliciete vraag, alleen voor accounts met uitsluitend de rollen `customer` en `subscriber` (nooit beheerders), en achter dezelfde API-sleutel als de rest van de route.
+
 ## [1.16.3] — 2026-09-15
 
 ### Fixed
