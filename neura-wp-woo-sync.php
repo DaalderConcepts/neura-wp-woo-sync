@@ -1596,7 +1596,8 @@ JS;
                 'postcode'   => $order->get_shipping_postcode(),
                 'country'    => $order->get_shipping_country(),
             ],
-            'coupon_codes'     => array_map(function($item) { return $item->get_code(); }, $order->get_coupon_codes()),
+            // get_coupon_codes() geeft al strings; ->get_code() daarop gaf een fatal bij elke order met een kortingscode.
+            'coupon_codes'     => array_values(array_map('strval', $order->get_coupon_codes())),
             'tracking_number'  => $order->get_meta('_tracking_number') ?: $order->get_meta('_wc_shipment_tracking_items') ?: null,
             'created_via'      => $order->get_created_via(),
         ];
