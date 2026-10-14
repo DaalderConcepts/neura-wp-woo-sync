@@ -4,7 +4,7 @@ declare(strict_types=1);
  * Plugin Name:  Neura WooCommerce Sync
  * Plugin URI:   https://github.com/DaalderConcepts/neura-wp-woo-sync
  * Description:  Synchroniseert WooCommerce data (producten, orders, klanten, COGS) met Neuramerce voor accurate ROAS tracking en conversie-optimalisatie.
- * Version:      1.16.6
+ * Version:      1.16.7
  * Author:       Daalder Concepts
  * Author URI:   https://daalderconcepts.com
  * Text Domain:  neura-wp-woo-sync
@@ -17,7 +17,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('NWWS_VERSION',    '1.16.6');
+define('NWWS_VERSION',    '1.16.7');
 define('NWWS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('NWWS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('NWWS_PLUGIN_FILE', __FILE__);
@@ -165,12 +165,19 @@ class Neura_GitHub_Updater {
             return $response;
         }
 
-        // Release asset ZIPs unpack to neura-wp-woo-sync/ directly — ensure correct destination
+        // WordPress levert de bestemming mét slash aan het eind; zonder normaliseren leek
+        // die altijd anders dan $target en wiste move(..., overwrite) de net geplaatste
+        // plugin, omdat move() eerst de bestemming verwijdert en bron = bestemming was.
         global $wp_filesystem;
-        $target = WP_PLUGIN_DIR . '/neura-wp-woo-sync';
-        if ($result['destination'] !== $target) {
-            $wp_filesystem->move($result['destination'], $target, true);
-            $result['destination'] = $target;
+        $target      = WP_PLUGIN_DIR . '/neura-wp-woo-sync';
+        $destination = untrailingslashit($result['destination']);
+        if ($destination !== $target) {
+            if ($wp_filesystem->exists($target)) {
+                $wp_filesystem->delete($target, true);
+            }
+            $wp_filesystem->move($destination, $target);
+            $result['destination']      = trailingslashit($target);
+            $result['destination_name'] = 'neura-wp-woo-sync';
         }
 
         activate_plugin('neura-wp-woo-sync/neura-wp-woo-sync.php');
@@ -1589,7 +1596,8 @@ JS;
                 'postcode'   => $order->get_shipping_postcode(),
                 'country'    => $order->get_shipping_country(),
             ],
-            'coupon_codes'     => array_map(function($item) { return $item->get_code(); }, $order->get_coupon_codes()),
+            // get_coupon_codes() geeft al strings; ->get_code() daarop gaf een fatal bij elke order met een kortingscode.
+            'coupon_codes'     => array_values(array_map('strval', $order->get_coupon_codes())),
             'tracking_number'  => $order->get_meta('_tracking_number') ?: $order->get_meta('_wc_shipment_tracking_items') ?: null,
             'created_via'      => $order->get_created_via(),
         ];

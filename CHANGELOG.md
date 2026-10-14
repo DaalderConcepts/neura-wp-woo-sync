@@ -1,5 +1,12 @@
 # Changelog — Neura WooCommerce Sync
 
+## [1.16.7] — 2026-10-14
+
+### Fixed
+- **Een automatische update wiste de plugin.** `after_install` vergeleek de bestemming van WordPress (met slash aan het eind) met het doelpad zonder slash, vond die altijd verschillend en riep `move(map, dezelfde map, overwrite)` aan. Sinds WordPress `move()` bij overwrite eerst de bestemming verwijdert, verdween de net geplaatste plugin (Hilox 14-10, ook andere shops). Nu genormaliseerd en alleen verplaatst als de map echt anders heet.
+- **Orders met een kortingscode kwamen nooit in Neura.** De order-push riep `->get_code()` aan op `get_coupon_codes()`, dat al strings teruggeeft: een fatal error bij elke order met een coupon (sinds 1.3.8). Bij Hilox ontbraken daardoor honderden orders.
+- Let op bij uitrollen: een shop die bijwerkt draait tijdens de update nog zijn OUDE `after_install`. De release-zip moet daarom een map met een andere naam bevatten (`neura-wp-woo-sync-1.16.7/`), dan verplaatst ook de oude code hem correct naar `neura-wp-woo-sync/`.
+
 ## [1.16.6] — 2026-09-30
 
 ### Fixed
